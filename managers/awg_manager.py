@@ -3419,12 +3419,14 @@ PersistentKeepalive = 25
                 f"{sync_err or 'no output'}. The clients table was NOT updated; "
                 f"retry the toggle.")
 
-        # Verify the toggle actually landed before persisting enabled=...:
-        # read the config back from the container (bypassing any stale cache)
-        # and check the peer's presence matches the requested state.
+        # Verify the toggle actually landed before persisting enabled=... .
+        # Read the config DIRECTLY from the container — not via
+        # _get_server_config, which may consume a freshly prefetched batch
+        # (built a request-moment ago) and misjudge the peer's presence.
         self._invalidate_config_cache(protocol_type)
-        applied_config = self._get_server_config(protocol_type)
-        if not applied_config.strip():
+        applied_config, _, vcode = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {config_path}")
+        if vcode != 0 or not (applied_config or '').strip():
             # Unreadable config must not be mistaken for a successful toggle.
             raise RuntimeError(
                 f"Could not read back {container_name} config after syncconf "
