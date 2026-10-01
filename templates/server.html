@@ -4095,6 +4095,14 @@
 
     async function toggleConnection(clientId, enable, btn) {
         const proto = document.getElementById('connProtoSelect').value;
+        // One toggle at a time across the whole instance: parallel toggles of
+        // DIFFERENT peers race the same server config file (each rewrites
+        // wg0.conf/awg0.conf wholesale) and trip the read-back verification.
+        if (window.peerToggling) {
+            showToast(_('conn_toggle_busy'), 'info');
+            return;
+        }
+        window.peerToggling = true;
         const action = enable ? _('enable_connection_progress') : _('disable_connection_progress');
         // Lock the whole client row and swap the bulb for a spinner until done
         const row = btn ? btn.closest('.client-item') : null;
@@ -4140,6 +4148,7 @@
         } catch (err) {
             showToast(_('error') + ': ' + err.message, 'error');
         } finally {
+            window.peerToggling = false;
             // Also on success: if loadConnections() fails the row it was
             // supposed to rebuild would stay disabled with a spinning bulb.
             restore();

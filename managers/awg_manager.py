@@ -3423,15 +3423,27 @@ PersistentKeepalive = 25
         # Read the config DIRECTLY from the container — not via
         # _get_server_config, which may consume a freshly prefetched batch
         # (built a request-moment ago) and misjudge the peer's presence.
+        # Rapid successive toggles (two requests racing the same config file)
+        # can make the first read-back see a pre-write state: retry a couple
+        # of times on a presence mismatch before raising.
         self._invalidate_config_cache(protocol_type)
-        applied_config, _, vcode = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} cat {config_path}")
-        if vcode != 0 or not (applied_config or '').strip():
-            # Unreadable config must not be mistaken for a successful toggle.
-            raise RuntimeError(
-                f"Could not read back {container_name} config after syncconf "
-                f"— NOT updating the clients table (verification impossible).")
-        peer_present = client_id in applied_config
+        peer_present = None
+        for attempt in range(3):
+            applied_config, _, vcode = self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} cat {config_path}")
+            if vcode != 0 or not (applied_config or '').strip():
+                # Unreadable config must not be mistaken for a successful toggle.
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Could not read back {container_name} config after syncconf "
+                        f"— NOT updating the clients table (verification impossible).")
+                time.sleep(0.6)
+                continue
+            peer_present = client_id in applied_config
+            if peer_present == enable:
+                break
+            if attempt < 2:
+                time.sleep(0.6)
         if enable and not peer_present:
             raise RuntimeError(
                 f"Peer {client_id[:12]}... is absent from {container_name} "

@@ -1000,14 +1000,26 @@ AllowedIPs = {client_ip}/32
         # Verify the toggle actually landed before persisting enabled=...:
         # read the config back DIRECTLY from the container (no cache layers)
         # and require the peer's presence to match the requested state.
-        applied_config, _, vcode = self.ssh.run_sudo_command(
-            f"docker exec -i {self.CONTAINER_NAME} cat {self.CONFIG_PATH}")
-        if vcode != 0 or not (applied_config or '').strip():
-            raise RuntimeError(
-                f"Could not read back {self.CONTAINER_NAME} config after "
-                f"syncconf — NOT updating the clients table (verification "
-               	f"impossible).")
-        peer_present = client_id in applied_config
+        # Rapid successive toggles (two HTTP requests racing the same config
+        # file) can make the first read-back see a pre-write state, so a
+        # presence mismatch gets a couple of retries before we raise.
+        peer_present = None
+        for attempt in range(3):
+            applied_config, _, vcode = self.ssh.run_sudo_command(
+                f"docker exec -i {self.CONTAINER_NAME} cat {self.CONFIG_PATH}")
+            if vcode != 0 or not (applied_config or '').strip():
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Could not read back {self.CONTAINER_NAME} config after "
+                        f"syncconf — NOT updating the clients table (verification "
+                        f"impossible).")
+                time.sleep(0.6)
+                continue
+            peer_present = client_id in applied_config
+            if peer_present == enable:
+                break
+            if attempt < 2:
+                time.sleep(0.6)
         if enable and not peer_present:
             raise RuntimeError(
                 f"Peer {client_id[:12]}... is absent from {self.CONTAINER_NAME} "
