@@ -3407,9 +3407,40 @@ PersistentKeepalive = 25
             self._invalidate_config_cache(protocol_type)
 
         # Sync config
-        self.ssh.run_sudo_command(
+        _, sync_err, sync_code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
         )
+        if sync_code != 0:
+            # A failed sync with an already-updated clients table is exactly
+            # how a peer ends up half-toggled (working in wg but shown off, or
+            # vice versa) — refuse to persist the new state instead.
+            raise RuntimeError(
+                f"syncconf failed for {container_name} (exit {sync_code}): "
+                f"{sync_err or 'no output'}. The clients table was NOT updated; "
+                f"retry the toggle.")
+
+        # Verify the toggle actually landed before persisting enabled=...:
+        # read the config back from the container (bypassing any stale cache)
+        # and check the peer's presence matches the requested state.
+        self._invalidate_config_cache(protocol_type)
+        applied_config = self._get_server_config(protocol_type)
+        if not applied_config.strip():
+            # Unreadable config must not be mistaken for a successful toggle.
+            raise RuntimeError(
+                f"Could not read back {container_name} config after syncconf "
+                f"— NOT updating the clients table (verification impossible).")
+        peer_present = client_id in applied_config
+        if enable and not peer_present:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is absent from {container_name} "
+                f"config right after enable — NOT updating the clients table "
+                f"(the enable did not land). Investigate the container state.")
+        if not enable and peer_present:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still present in "
+                f"{container_name} config right after disable — NOT marking "
+                f"it disabled in the clients table (a half-applied disable "
+                f"once left a working peer shown as off and un-re-enablable).")
 
         # Update enabled status in clients table
         for c in clients_table:

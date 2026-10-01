@@ -164,6 +164,47 @@ class ServerConfigCacheTests(unittest.TestCase):
 
         self.assertIn('Jc = 7', self.manager._get_server_config('awg'))
 
+    def _table_with_peer_b(self, enabled=True):
+        return json.dumps([{
+            'clientId': 'PEER_B',
+            'userData': {'clientName': 'b', 'clientIp': '10.8.1.3', 'psk': 'PSK_B', 'enabled': enabled},
+        }])
+
+    def test_silent_config_copy_failure_aborts_disable(self):
+        """docker cp reports success but the peer stays in the container
+        config: the table must NOT be flipped to enabled=false (the
+        EUROBYTE half-disabled-peer incident)."""
+        self.ssh.files[CLIENTS_TABLE] = self._table_with_peer_b(enabled=True)
+        table_before = self.ssh.files[CLIENTS_TABLE]
+        real = self.ssh.run_sudo_command
+
+        def flaky(command, timeout=60):
+            if re.search(r"docker cp (\S+) \S+?:(\S+)", command):
+                return '', '', 0  # pretend success, do NOT copy
+            return real(command, timeout)
+
+        self.ssh.run_sudo_command = flaky
+        with self.assertRaises(RuntimeError):
+            self.manager.toggle_client('awg', 'PEER_B', False)
+        self.assertEqual(self.ssh.files[CLIENTS_TABLE], table_before)
+        self.assertIn('PEER_B', self.ssh.files[CONFIG_PATH])
+
+    def test_failed_syncconf_aborts_toggle(self):
+        """syncconf exiting non-zero must leave the clients table alone."""
+        self.ssh.files[CLIENTS_TABLE] = self._table_with_peer_b(enabled=True)
+        table_before = self.ssh.files[CLIENTS_TABLE]
+        real = self.ssh.run_sudo_command
+
+        def flaky(command, timeout=60):
+            if 'syncconf' in command:
+                return '', 'boom', 1
+            return real(command, timeout)
+
+        self.ssh.run_sudo_command = flaky
+        with self.assertRaises(RuntimeError):
+            self.manager.toggle_client('awg', 'PEER_B', False)
+        self.assertEqual(self.ssh.files[CLIENTS_TABLE], table_before)
+
 
 if __name__ == '__main__':
     unittest.main()
