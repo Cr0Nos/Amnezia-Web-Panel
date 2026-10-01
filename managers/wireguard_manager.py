@@ -985,9 +985,41 @@ AllowedIPs = {client_ip}/32
             self.ssh.run_command("rm -f /tmp/_wg_config.conf")
 
         # Sync config
-        self.ssh.run_sudo_command(
+        _, sync_err, sync_code = self.ssh.run_sudo_command(
             f"docker exec -i {self.CONTAINER_NAME} bash -c 'wg syncconf {self.INTERFACE} <(wg-quick strip {self.CONFIG_PATH})'"
         )
+        if sync_code != 0:
+            # A failed sync with an already-updated clients table is exactly
+            # how a peer ends up half-toggled (working in wg but shown off, or
+            # vice versa) — refuse to persist the new state instead.
+            raise RuntimeError(
+                f"syncconf failed for {self.CONTAINER_NAME} (exit {sync_code}): "
+                f"{sync_err or 'no output'}. The clients table was NOT updated; "
+                f"retry the toggle.")
+
+        # Verify the toggle actually landed before persisting enabled=...:
+        # read the config back DIRECTLY from the container (no cache layers)
+        # and require the peer's presence to match the requested state.
+        applied_config, _, vcode = self.ssh.run_sudo_command(
+            f"docker exec -i {self.CONTAINER_NAME} cat {self.CONFIG_PATH}")
+        if vcode != 0 or not (applied_config or '').strip():
+            raise RuntimeError(
+                f"Could not read back {self.CONTAINER_NAME} config after "
+                f"syncconf — NOT updating the clients table (verification "
+               	f"impossible).")
+        peer_present = client_id in applied_config
+        if enable and not peer_present:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is absent from {self.CONTAINER_NAME} "
+                f"config right after enable — NOT updating the clients table "
+                f"(the enable did not land). Investigate the container state.")
+        if not enable and peer_present:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still present in "
+                f"{self.CONTAINER_NAME} config right after disable — NOT "
+                f"marking it disabled in the clients table (a half-applied "
+                f"disable once left a working peer shown as off and "
+                f"un-re-enablable).")
 
         # Update enabled status in clients table
         clients_table = self._get_clients_table()
@@ -1012,9 +1044,21 @@ AllowedIPs = {client_ip}/32
         self.ssh.run_command("rm -f /tmp/_wg_config.conf")
 
         # Sync config
-        self.ssh.run_sudo_command(
+        _, rm_err, rm_code = self.ssh.run_sudo_command(
             f"docker exec -i {self.CONTAINER_NAME} bash -c 'wg syncconf {self.INTERFACE} <(wg-quick strip {self.CONFIG_PATH})'"
         )
+        if rm_code != 0:
+            raise RuntimeError(
+                f"syncconf failed for {self.CONTAINER_NAME} (exit {rm_code}): "
+                f"{rm_err or 'no output'}. The clients table was NOT updated.")
+
+        applied_config, _, vcode = self.ssh.run_sudo_command(
+            f"docker exec -i {self.CONTAINER_NAME} cat {self.CONFIG_PATH}")
+        if vcode == 0 and client_id in (applied_config or ''):
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still present in "
+                f"{self.CONTAINER_NAME} config after removal — NOT dropping "
+                f"it from the clients table (removal did not land).")
 
         # Update clients table
         clients_table = self._get_clients_table()
