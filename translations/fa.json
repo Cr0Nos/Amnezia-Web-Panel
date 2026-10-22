@@ -763,5 +763,16 @@
   "rknblock_disabled_short": "خاموش",
   "rknblock_opt_block_in_short": "ورودی",
   "rknblock_opt_block_out_short": "خروجی",
-  "rknblock_opt_log_off_short": "ثبت رویداد"
+  "rknblock_opt_log_off_short": "ثبت رویداد",
+    "ssh_trust_title": "کلید میزبان SSH",
+    "ssh_trust_warning": "اثر انگشت را مستقل از این صفحه در کنسول سرور یا ارائهدهنده بررسی کنید (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). تغییر کلید ممکن است نشانه حمله باشد. فقط به دلیل نمایش کلید در این صفحه به آن اعتماد نکنید.",
+    "ssh_trust_inspect": "بررسی کلید SSH",
+    "ssh_trust_verified": "این اثر انگشت دقیق را در کنسول مستقل تأیید کردم.",
+    "ssh_trust_save": "اعتماد به کلید و تلاش مجدد",
+    "ssh_trust_unknown": "کلید SSH ناشناخته",
+    "ssh_trust_changed": "کلید SSH تغییر کرده",
+    "ssh_trust_trusted": "کلید SSH مورد اعتماد",
+    "ssh_trust_new": "کلید پیشنهادی",
+    "ssh_trust_old": "کلیدهای مورد اعتماد قبلی",
+    "ssh_trust_error": "بررسی اعتماد SSH ناموفق بود"
 }

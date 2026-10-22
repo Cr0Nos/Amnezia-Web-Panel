@@ -763,5 +763,16 @@
   "rknblock_disabled_short": "выключено",
   "rknblock_opt_block_in_short": "входящие",
   "rknblock_opt_block_out_short": "исходящие",
-  "rknblock_opt_log_off_short": "логирование"
+  "rknblock_opt_log_off_short": "логирование",
+    "ssh_trust_title": "Ключ SSH сервера",
+    "ssh_trust_warning": "Независимо проверьте отпечаток через консоль сервера/провайдера (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). Изменение ключа может означать атаку. Не доверяйте ключу только потому, что он показан здесь.",
+    "ssh_trust_inspect": "Проверить ключ SSH",
+    "ssh_trust_verified": "Я сверил именно этот отпечаток через независимую консоль.",
+    "ssh_trust_save": "Доверять ключу и повторить",
+    "ssh_trust_unknown": "Неизвестный ключ SSH",
+    "ssh_trust_changed": "Ключ SSH изменился",
+    "ssh_trust_trusted": "Ключ SSH доверенный",
+    "ssh_trust_new": "Новый ключ",
+    "ssh_trust_old": "Ранее доверенные ключи",
+    "ssh_trust_error": "Ошибка проверки доверия SSH"
 }

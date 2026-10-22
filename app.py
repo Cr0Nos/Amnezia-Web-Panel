@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, constr
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -43,6 +43,7 @@ except ImportError:
     CaptchaGenerator = None
 
 from managers.ssh_manager import SSHManager
+from managers import ssh_trust
 from managers.awg_manager import AWGManager, normalize_special_junk
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
@@ -201,6 +202,7 @@ else:
 DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
+ssh_trust.configure(DATA_FILE)
 CURRENT_VERSION = "v1.7.8"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
@@ -3143,6 +3145,63 @@ def _check_admin(request):
     return None
 
 
+class SSHTrustConfirmation(BaseModel):
+    token: constr(min_length=1, max_length=4096)
+    confirmed: StrictBool
+
+
+def _ssh_trust_admin(request):
+    # Keep session/Bearer authorization; reject cross-origin browser writes.
+    origin = request.headers.get('origin')
+    fetch_site = request.headers.get('sec-fetch-site')
+    # Modern browsers supply unforgeable-by-JS same-origin metadata even
+    # behind TLS-terminating proxies. Do not trust arbitrary Forwarded headers.
+    if origin and fetch_site != 'same-origin' and origin.rstrip('/') != str(request.base_url).rstrip('/'):
+        return False
+    if fetch_site in ('cross-site', 'same-site'):
+        return False
+    user = _check_admin(request)
+    return bool(user and user['role'] == 'admin')
+
+
+@app.post('/api/servers/{server_id}/ssh-trust/inspect', tags=["Servers"])
+def api_ssh_trust_inspect(request: Request, server_id: int):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    try:
+        return ssh_trust.inspect(servers[server_id])
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
+@app.post('/api/servers/{server_id}/ssh-trust/confirm', tags=["Servers"])
+def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.confirmed:
+        return JSONResponse({'error': 'Explicit confirmation required'}, status_code=400)
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = servers[server_id]
+    try:
+        def unchanged():
+            current = load_data()['servers']
+            return (server_id < len(current) and
+                    all(current[server_id].get(k) == server.get(k)
+                        for k in ('uid', 'host', 'ssh_port')))
+        # Serialize the final endpoint check and trust write with server edits.
+        with data_manager.lock:
+            result = ssh_trust.enroll(server, req.token, validate_endpoint=unchanged)
+            drop_ssh(server)
+        return result
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
 @app.post('/api/servers/add', tags=["Servers"])
 def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
@@ -3265,7 +3324,11 @@ async def api_server_ping(request: Request, server_id: int):
             await writer.wait_closed()
         except Exception:
             pass
-        return {'alive': True, 'ms': ms}
+        try:
+            trust = await asyncio.to_thread(ssh_trust.saved_status, server)
+            return {'alive': True, 'ms': ms, 'ssh_trust': trust, 'ssh_verified': False}
+        except Exception:
+            return {'alive': True, 'ms': ms, 'ssh_trust': 'error'}
     except asyncio.TimeoutError:
         return {'alive': False, 'error': 'timeout', 'ms': None}
     except Exception as e:

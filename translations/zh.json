@@ -763,5 +763,16 @@
   "rknblock_disabled_short": "已关闭",
   "rknblock_opt_block_in_short": "入站",
   "rknblock_opt_block_out_short": "出站",
-  "rknblock_opt_log_off_short": "日志"
+  "rknblock_opt_log_off_short": "日志",
+    "ssh_trust_title": "SSH 主机密钥",
+    "ssh_trust_warning": "请通过服务器或提供商控制台独立核对指纹（ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub）。密钥变更可能意味着攻击。不要仅因为此页面显示密钥就信任它。",
+    "ssh_trust_inspect": "检查 SSH 密钥",
+    "ssh_trust_verified": "我已通过独立控制台核对这一确切指纹。",
+    "ssh_trust_save": "信任密钥并重试",
+    "ssh_trust_unknown": "未知 SSH 密钥",
+    "ssh_trust_changed": "SSH 密钥已变更",
+    "ssh_trust_trusted": "SSH 密钥已信任",
+    "ssh_trust_new": "候选密钥",
+    "ssh_trust_old": "以前信任的密钥",
+    "ssh_trust_error": "SSH 信任检查失败"
 }

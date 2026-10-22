@@ -763,5 +763,16 @@
   "rknblock_disabled_short": "disabled",
   "rknblock_opt_block_in_short": "inbound",
   "rknblock_opt_block_out_short": "outbound",
-  "rknblock_opt_log_off_short": "logging"
+  "rknblock_opt_log_off_short": "logging",
+    "ssh_trust_title": "SSH host key",
+    "ssh_trust_warning": "Verify the fingerprint independently using the server/provider console (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). A changed key may indicate an attack. Never trust a key only because this page shows it.",
+    "ssh_trust_inspect": "Inspect SSH key",
+    "ssh_trust_verified": "I verified this exact fingerprint through an independent console.",
+    "ssh_trust_save": "Trust key and retry",
+    "ssh_trust_unknown": "Unknown SSH key",
+    "ssh_trust_changed": "SSH key changed",
+    "ssh_trust_trusted": "SSH key trusted",
+    "ssh_trust_new": "Candidate key",
+    "ssh_trust_old": "Previously trusted keys",
+    "ssh_trust_error": "SSH trust check failed"
 }

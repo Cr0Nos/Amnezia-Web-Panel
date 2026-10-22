@@ -763,5 +763,16 @@
   "rknblock_disabled_short": "désactivé",
   "rknblock_opt_block_in_short": "entrant",
   "rknblock_opt_block_out_short": "sortant",
-  "rknblock_opt_log_off_short": "journalisation"
+  "rknblock_opt_log_off_short": "journalisation",
+    "ssh_trust_title": "Clé hôte SSH",
+    "ssh_trust_warning": "Vérifiez indépendamment l’empreinte via la console du serveur/fournisseur (ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub). Un changement peut signaler une attaque. Ne faites pas confiance à une clé uniquement parce que cette page l’affiche.",
+    "ssh_trust_inspect": "Examiner la clé SSH",
+    "ssh_trust_verified": "J’ai vérifié cette empreinte exacte via une console indépendante.",
+    "ssh_trust_save": "Faire confiance et réessayer",
+    "ssh_trust_unknown": "Clé SSH inconnue",
+    "ssh_trust_changed": "Clé SSH modifiée",
+    "ssh_trust_trusted": "Clé SSH approuvée",
+    "ssh_trust_new": "Clé proposée",
+    "ssh_trust_old": "Anciennes clés approuvées",
+    "ssh_trust_error": "Échec de vérification SSH"
 }
