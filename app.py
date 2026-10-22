@@ -203,7 +203,7 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
-CURRENT_VERSION = "v1.7.8"
+CURRENT_VERSION = "v1.7.9"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -3177,8 +3177,27 @@ def api_ssh_trust_inspect(request: Request, server_id: int):
         return JSONResponse({'error': str(exc)}, status_code=409)
 
 
+async def _finish_locked_worker(function):
+    """Do not release a caller's lock while its worker can still mutate state."""
+    worker = asyncio.create_task(asyncio.to_thread(function))
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        # Retrieve any worker exception, but preserve the request cancellation.
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
+
+
 @app.post('/api/servers/{server_id}/ssh-trust/confirm', tags=["Servers"])
-def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
+async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
     if not _ssh_trust_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     if not req.confirmed:
@@ -3194,9 +3213,13 @@ def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirm
                     all(current[server_id].get(k) == server.get(k)
                         for k in ('uid', 'host', 'ssh_port')))
         # Serialize the final endpoint check and trust write with server edits.
-        with data_manager.lock:
-            result = ssh_trust.enroll(server, req.token, validate_endpoint=unchanged)
-            drop_ssh(server)
+        async with DATA_LOCK:
+            def enroll_and_reset():
+                result = ssh_trust.enroll(server, req.token, validate_endpoint=unchanged)
+                drop_ssh(server)
+                return result
+
+            result = await _finish_locked_worker(enroll_and_reset)
         return result
     except Exception as exc:
         return JSONResponse({'error': str(exc)}, status_code=409)
@@ -3240,61 +3263,65 @@ def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
-def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
+async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
     """Update connection details for an existing server entry. Verifies the new
     credentials by SSH-connecting before persisting, so a typo can't lock us out.
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-
-        new_host = (req.host or '').strip() or server['host']
-        new_user = (req.username or '').strip() or server['username']
-        new_port = int(req.ssh_port or server.get('ssh_port', 22))
-        new_name = (req.name or '').strip() or server.get('name') or new_host
-
-        # Credential resolution: a non-empty value in either field switches to
-        # that auth method (and clears the other). Both omitted => keep current.
-        if req.private_key:
-            new_pass, new_key = '', req.private_key
-        elif req.password:
-            new_pass, new_key = req.password, ''
-        else:
-            new_pass = server.get('password', '')
-            new_key = server.get('private_key', '')
-
-        if not new_pass and not new_key:
-            return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
-
-        # Verify the new connection details before committing the change.
-        ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+    def edit():
         try:
-            ssh.connect()
-            server_info = ssh.test_connection()
-            ssh.disconnect()
-        except Exception as e:
-            return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+            data = load_data()
+            if server_id >= len(data['servers']):
+                return JSONResponse({'error': 'Server not found'}, status_code=404)
+            server = data['servers'][server_id]
 
-        server['name'] = new_name
-        server['host'] = new_host
-        server['ssh_port'] = new_port
-        server['username'] = new_user
-        server['password'] = new_pass
-        server['private_key'] = new_key
-        server['server_info'] = server_info
-        if req.self_service_enabled is not None:
-            server['self_service_enabled'] = bool(req.self_service_enabled)
-        save_data(data)
-        # Drop the stale pooled connection: credentials/host may have changed.
-        drop_ssh(server)
-        return {'status': 'success', 'server_info': server_info}
-    except Exception as e:
-        logger.exception("Error editing server")
-        return JSONResponse({'error': str(e)}, status_code=500)
+            new_host = (req.host or '').strip() or server['host']
+            new_user = (req.username or '').strip() or server['username']
+            new_port = int(req.ssh_port or server.get('ssh_port', 22))
+            new_name = (req.name or '').strip() or server.get('name') or new_host
+
+            # Credential resolution: a non-empty value in either field switches to
+            # that auth method (and clears the other). Both omitted => keep current.
+            if req.private_key:
+                new_pass, new_key = '', req.private_key
+            elif req.password:
+                new_pass, new_key = req.password, ''
+            else:
+                new_pass = server.get('password', '')
+                new_key = server.get('private_key', '')
+
+            if not new_pass and not new_key:
+                return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
+
+            # Verify the new connection details before committing the change.
+            ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+            try:
+                ssh.connect()
+                server_info = ssh.test_connection()
+                ssh.disconnect()
+            except Exception as e:
+                return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+
+            server['name'] = new_name
+            server['host'] = new_host
+            server['ssh_port'] = new_port
+            server['username'] = new_user
+            server['password'] = new_pass
+            server['private_key'] = new_key
+            server['server_info'] = server_info
+            if req.self_service_enabled is not None:
+                server['self_service_enabled'] = bool(req.self_service_enabled)
+            save_data(data)
+            # Drop the stale pooled connection: credentials/host may have changed.
+            drop_ssh(server)
+            return {'status': 'success', 'server_info': server_info}
+        except Exception as e:
+            logger.exception("Error editing server")
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    async with DATA_LOCK:
+        return await _finish_locked_worker(edit)
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])
@@ -3385,20 +3412,21 @@ async def api_delete_server(request: Request, server_id: int):
             await exit_link_svc.forget_entry_peers(server)
         except Exception as e:
             logger.warning(f"exit-link cleanup before delete failed: {e}")
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-        await asyncio.to_thread(drop_ssh, server)
-        data['servers'].pop(server_id)
-        # Clean up connections for this server
-        data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
-        # Adjust server_ids for connections pointing to higher indices
-        for c in data.get('user_connections', []):
-            if c.get('server_id', 0) > server_id:
-                c['server_id'] -= 1
-        save_data(data)
-        return {'status': 'success'}
+        async with DATA_LOCK:
+            data = load_data()
+            if server_id >= len(data['servers']):
+                return JSONResponse({'error': 'Server not found'}, status_code=404)
+            server = data['servers'][server_id]
+            await _finish_locked_worker(lambda: drop_ssh(server))
+            data['servers'].pop(server_id)
+            # Clean up connections for this server
+            data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
+            # Adjust server_ids for connections pointing to higher indices
+            for c in data.get('user_connections', []):
+                if c.get('server_id', 0) > server_id:
+                    c['server_id'] -= 1
+            save_data(data)
+            return {'status': 'success'}
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
 

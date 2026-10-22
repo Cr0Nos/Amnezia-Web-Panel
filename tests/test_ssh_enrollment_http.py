@@ -1,38 +1,45 @@
 """HTTP authorization and explicit confirmation, without loading real state."""
-import ast
-import threading
+import asyncio
+import importlib
+import os
+import tempfile
+
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+
 from unittest import mock
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from pydantic import BaseModel, StrictBool, constr
 from managers import ssh_trust
 
 
 class EnrollmentHTTPTests(unittest.TestCase):
     def setUp(self):
-        tree = ast.parse((Path(__file__).resolve().parents[1] / 'app.py').read_text(encoding='utf-8'))
-        names = {'SSHTrustConfirmation', '_ssh_trust_admin', 'api_ssh_trust_inspect', 'api_ssh_trust_confirm'}
-        nodes = [n for n in tree.body if getattr(n, 'name', '') in names]
-        self.assertEqual(len(nodes), 4, 'SSH trust routes and request model must exist')
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        env = mock.patch.dict(os.environ, {'DATA_FILE': str(root / 'data.json'),
+            'TUNNEL_STATE_FILE': str(root / 'tunnels.json'),
+            'SSH_KNOWN_HOSTS_FILE': str(root / 'known_hosts')})
+        env.start()
+        self.addCleanup(env.stop)
+        self.module = importlib.import_module('app')
         self.user = {'role': 'admin'}
         self.server = {'host': 'example.test', 'ssh_port': 22, 'uid': 'a'}
         self.trust = mock.Mock()
         self.trust.inspect.return_value = {'status': 'unknown', 'token': 'abc'}
         self.trust.enroll.return_value = {'status': 'success'}
         self.drop = mock.Mock()
-        app = FastAPI()
-        self.data_lock = threading.RLock()
-        ns = dict(app=app, Request=Request, JSONResponse=JSONResponse, BaseModel=BaseModel,
-                  StrictBool=StrictBool, constr=constr, ssh_trust=self.trust,
-                  _check_admin=lambda request: self.user, load_data=lambda: {'servers': [self.server]},
-                  drop_ssh=self.drop, data_manager=SimpleNamespace(lock=self.data_lock))
-        exec(compile(ast.Module(body=nodes, type_ignores=[]), '<trust routes>', 'exec'), ns)
-        self.client = TestClient(app)
+        self.data_lock = asyncio.Lock()
+        for name, value in [('DATA_LOCK', self.data_lock), ('ssh_trust', self.trust),
+                            ('_check_admin', lambda request: self.user),
+                            ('load_data', lambda: {'servers': [self.server]}),
+                            ('drop_ssh', self.drop)]:
+            patch = mock.patch.object(self.module, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.client = TestClient(self.module.app)
+        self.addCleanup(self.client.close)
 
     def test_admin_only(self):
         for user in [None, {'role': 'support'}, {'role': 'user'}]:
@@ -53,7 +60,7 @@ class EnrollmentHTTPTests(unittest.TestCase):
 
     def test_confirmation_serializes_endpoint_mutations(self):
         def enroll(*args, **kwargs):
-            self.assertTrue(self.data_lock._is_owned())
+            self.assertTrue(self.data_lock.locked())
             return {'status': 'success'}
         self.trust.enroll.side_effect = enroll
         response = self.client.post('/api/servers/0/ssh-trust/confirm',
