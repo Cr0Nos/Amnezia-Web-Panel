@@ -172,6 +172,7 @@
             </button>
         </div>
     </div>
+
     <div id="serverStatus" class="mt-md hidden">
         <div class="divider"></div>
         <div class="server-status-row">
@@ -495,6 +496,97 @@
                 style="flex:1">
                 {{ _('install') }}
             </button>
+        </div>
+    </div>
+
+
+    <!-- RKN Block Card (host-level app, C24Be lists) -->
+    <div class="card card-hover protocol-card protocol-rknblock" id="proto-rknblock">
+        <div class="protocol-card-head">
+            <div class="protocol-icon">🌈</div>
+            <div class="protocol-name">{{ _('rkn_block_title') }}</div>
+        </div>
+        <div class="protocol-desc">
+            {{ _('rknblock_desc') }}
+        </div>
+        <div class="protocol-status" id="rknblock-status">
+            <span class="badge badge-warn"><span class="badge-dot"></span> {{ _('not_installed') }}</span>
+        </div>
+        <div id="rknblock-info" class="hidden">
+            <div class="protocol-info" id="rknblock-info-grid"></div>
+        </div>
+        <div class="flex gap-sm" id="rknblock-actions">
+            <button class="btn btn-primary btn-sm" onclick="installRknBlock()" id="rknblock-install-btn"
+                style="flex:1">
+                {{ _('install') }}
+            </button>
+        </div>
+        <div id="rknblock-installed-actions" style="display:none;">
+            <button class="btn btn-secondary btn-sm" onclick="toggleRknBlockApp(false)" id="rknblock-toggle-btn"
+                style="flex:1">
+                {{ _('rknblock_stop') }}
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="updateRknBlockLists()" id="rknblock-update-btn"
+                style="flex:1">
+                {{ _('rknblock_update') }}
+            </button>
+            <button class="btn btn-secondary btn-sm" onclick="openRknOptionsModal()" id="rknblock-options-btn"
+                style="flex:1">
+                {{ _('rknblock_options') }}
+            </button>
+            <button class="btn btn-danger btn-sm" onclick="uninstallRknBlock()" id="rknblock-uninstall-btn"
+                style="flex:1">
+                {{ _('rknblock_delete') }}
+            </button>
+        </div>
+    </div>
+
+    <!-- ===== RKN Block scans modal ===== -->
+    <div class="modal-backdrop" id="rknScansModal">
+        <div class="modal" style="max-width:720px;">
+            <div class="modal-header">
+                <h2 class="modal-title">{{ _('rkn_scans_title') }}</h2>
+                <button class="modal-close" onclick="closeModal('rknScansModal')">×</button>
+            </div>
+            <div id="rknblock-modal-body" style="max-height:60vh; overflow-y:auto;"></div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="clearRknScans()"
+                    title="{{ _('rkn_block_clear') }}" id="rknClearBtn">🗑 {{ _('rkn_block_clear') }}</button>
+                <button class="btn btn-primary" onclick="closeModal('rknScansModal')">{{ _('cancel') }}</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ===== RKN Block options modal (per-direction flags) ===== -->
+    <div class="modal-backdrop" id="rknOptionsModal">
+        <div class="modal" style="max-width:520px;">
+            <div class="modal-header">
+                <h2 class="modal-title">{{ _('rknblock_options_title') }}</h2>
+                <button class="modal-close" onclick="closeModal('rknOptionsModal')">×</button>
+            </div>
+            <div>
+                <div class="form-hint" style="margin-bottom:12px;">{{ _('rknblock_options_hint') }}</div>
+                <label class="flex items-center gap-sm" style="padding:6px 0; cursor:pointer;">
+                    <input type="checkbox" id="rknOptBlockIn" checked>
+                    <span>{{ _('rknblock_opt_block_in') }}</span>
+                </label>
+                <label class="flex items-center gap-sm" style="padding:6px 0; cursor:pointer;">
+                    <input type="checkbox" id="rknOptBlockOut" checked>
+                    <span>{{ _('rknblock_opt_block_out') }}</span>
+                </label>
+                <label class="flex items-center gap-sm" style="padding:6px 0; cursor:pointer;">
+                    <input type="checkbox" id="rknOptLogIn" checked>
+                    <span>{{ _('rknblock_opt_log_in') }}</span>
+                </label>
+                <label class="flex items-center gap-sm" style="padding:6px 0; cursor:pointer;">
+                    <input type="checkbox" id="rknOptLogOut" checked>
+                    <span>{{ _('rknblock_opt_log_out') }}</span>
+                </label>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="closeModal('rknOptionsModal')">{{ _('cancel') }}</button>
+                <button class="btn btn-primary" onclick="saveRknOptions()" id="rknOptionsSaveBtn">{{ _('save') }}</button>
+            </div>
         </div>
     </div>
 
@@ -1333,6 +1425,7 @@
         { proto: 'adguard', category: 'services', icon: '🛡️', title: 'AdGuard Home', descKey: 'adguard_desc' },
         { proto: 'socks5', category: 'services', icon: '🧦', title: 'SOCKS5 Proxy', descKey: 'socks5_desc' },
         { proto: 'exit', category: 'services', icon: '🚪', title: 'Exit Node', descKey: 'exit_desc', badge: 'NEW' },
+        { proto: 'rknblock', category: 'services', icon: '🌈', title: 'RKN Block (C24Be)', descKey: 'rknblock_desc' },
         { proto: 'nginx', category: 'web_servers', icon: '🌐', title: 'NGINX', descKey: 'nginx_desc' },
     ];
     const MARKETPLACE_CATEGORIES = [
@@ -1351,6 +1444,8 @@
     let installedAppsLoading = true;
     let currentSocks5Proto = 'socks5';
     let currentAwgProto = 'awg2';
+    // RKN Block app state (GET /api/servers/{id}/rkn_scans); null = not loaded.
+    let rknBlockStatus = null;
 
     const AWG_PROTOCOLS = ['awg', 'awg2', 'awg3', 'awg_legacy'];
     // Protocols that hand out a client config or link, and therefore have an
@@ -1601,8 +1696,18 @@
                     <div class="marketplace-category-title"><span>${cat.icon}</span> ${_(cat.titleKey)}</div>
                     <div class="marketplace-grid">
                         ${apps.map(app => {
-                            const installed = baseInstalled(app.proto);
+                            const isRkn = app.proto === 'rknblock';
+                            const installed = isRkn ? !!(rknBlockStatus && rknBlockStatus.installed)
+                                : baseInstalled(app.proto);
                             const canInstallAnother = installed && isMultiInstanceBase(app.proto);
+                            const action = isRkn
+                                ? (installed ? 'disabled' : `onclick="closeModal('marketplaceModal'); installRknBlock()"`)
+                                : (installed && !canInstallAnother ? 'disabled' : `onclick="installFromMarketplace('${app.proto}', ${canInstallAnother ? 'true' : 'false'})"`);
+                            const statusBadge = isRkn
+                                ? (installed
+                                    ? `<span class="badge badge-success"><span class="badge-dot"></span> ${_('installed')}</span>`
+                                    : `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('not_installed')}</span>`)
+                                : marketplaceAppStatus(app.proto);
                             return `
                                 <div class="marketplace-app-card">
                                     <div class="marketplace-app-top">
@@ -1671,12 +1776,26 @@
             // keep a deleted base card on screen as "not installed / install"
             // — a phantom instance right after uninstall. Extra instances
             // render their own dynamic cards (ensureProtocolCard) below.
+            // RKN Block is host-level (no container status): its card is
+            // driven by rknBlockStatus further below.
+            if (app.proto === 'rknblock') return;
             const installed = isAppInstalled((currentProtocolStatus || {})[app.proto]);
             if (card) {
                 card.classList.toggle('installed-app-hidden', !installed);
                 card.classList.toggle('installed-app-visible', installed);
             }
         });
+
+        // RKN Block card: host-level app, installed-state comes from the
+        // rkn_scans endpoint (server['rknblock']) rather than protocol check.
+        const rknInstalled = !!(rknBlockStatus && rknBlockStatus.installed);
+        const rknCard = document.getElementById('proto-rknblock');
+        if (rknCard) {
+            rknCard.classList.toggle('installed-app-hidden', !rknInstalled);
+            rknCard.classList.toggle('installed-app-visible', rknInstalled);
+        }
+        if (rknInstalled) installedCount++;
+        renderRknBlockCard();
 
         orderedProtocolEntries(currentProtocolStatus || {}).forEach(([proto, info]) => {
             if (protoInstance(proto) > 1) {
@@ -4180,6 +4299,294 @@
             window.location.href = '/';
         } catch (err) {
             showToast('Error: ' + err.message, 'error');
+        }
+    }
+
+    // ========== RKN extra block (C24Be lists) — raw prototype ==========
+    // Well-known destination ports: what service the scanner was poking.
+    const RKN_SVC_NAMES = {22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS', 80: 'HTTP',
+        110: 'POP3', 111: 'RPC', 135: 'RPC', 139: 'SMB', 143: 'IMAP', 445: 'SMB',
+        873: 'rsync', 993: 'IMAPS', 995: 'POP3S', 1723: 'PPTP', 1900: 'UPnP',
+        3128: 'Proxy', 3306: 'MySQL', 3389: 'RDP', 5000: 'Panel', 5060: 'SIP',
+        5900: 'VNC', 6379: 'Redis', 8080: 'HTTP-alt', 8443: 'HTTPS-alt', 8888: 'HTTP-alt',
+        9200: 'Elastic', 11211: 'Memcached', 27017: 'MongoDB', 51820: 'WireGuard', 51821: 'AWG'};
+    function svcName(p) {
+        const n = parseInt(p, 10);
+        return p + (RKN_SVC_NAMES[n] ? ' (' + RKN_SVC_NAMES[n] + ')' : '');
+    }
+
+    async function loadRknBlock() {
+        try {
+            rknBlockStatus = await apiCall(`/api/servers/${SERVER_ID}/rkn_scans`, 'GET');
+        } catch (err) {
+            rknBlockStatus = null;
+            console.warn('RKN block load failed:', err);
+        }
+        // Render failures must not escape: this runs during page init, and
+        // an exception here used to cascade into the instance rendering.
+        try {
+            renderRknBlockCard();
+        } catch (err) {
+            console.error('RKN block render failed:', err);
+        }
+        applyInstalledAppsVisibility();
+        return rknBlockStatus;
+    }
+
+    function renderRknBlockCard() {
+        const d = rknBlockStatus;
+        const statusEl = document.getElementById('rknblock-status');
+        if (!statusEl) return;
+        const card = document.getElementById('proto-rknblock');
+        const infoEl = document.getElementById('rknblock-info');
+        const grid = document.getElementById('rknblock-info-grid');
+        const installActions = document.getElementById('rknblock-actions');
+        const installedActions = document.getElementById('rknblock-installed-actions');
+        const toggleBtn = document.getElementById('rknblock-toggle-btn');
+        const installed = !!(d && d.installed);
+        installActions.style.display = installed ? 'none' : '';
+        installedActions.style.display = installed ? '' : 'none';
+        if (!installed) {
+            statusEl.innerHTML = `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('not_installed')}</span>`;
+            infoEl.classList.add('hidden');
+            if (location.hash === '#proto-rknblock' && card) {
+                setTimeout(() => card.scrollIntoView({ behavior: 'smooth', block: 'center' }), 300);
+            }
+            return;
+        }
+        const agentAlive = d.agent_state !== 'unknown';
+        const running = agentAlive && d.enabled !== false;
+        const sets = d.sets || {};
+        const inN = (sets.in4 || 0) + (sets.in6 || 0);
+        const outN = (sets.out4 || 0) + (sets.out6 || 0);
+        const setsEmpty = [sets.in4, sets.in6, sets.out4, sets.out6].every(v => !v);
+
+        // Status badge + red scan-alert badge that opens the scans modal.
+        let badge = running
+            ? `<span class="badge badge-success"><span class="badge-dot"></span> ${_('rknblock_state_on')}</span>`
+            : (agentAlive
+                ? `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('rknblock_state_off')}</span>`
+                : `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('rknblock_state_unreachable')}</span>`);
+        if (d.last_24h > 0) {
+            badge += ` <button type="button"
+                style="background:var(--danger,#f85149); color:#fff; cursor:pointer; border:none;
+                       padding:2px 10px; border-radius:10px; font-size:0.75rem; font-weight:700;"
+                onclick="openRknScansModal()"
+                title="${escapeHtml(_('rkn_block_recent'))}">⚠ ${escapeHtml(_('rkn_scan_alert'))} (${d.last_24h}) · ${escapeHtml(_('rkn_scans_more'))}</button>`;
+        }
+        statusEl.innerHTML = badge;
+        toggleBtn.textContent = running ? _('rknblock_stop') : _('rknblock_start');
+
+        // Card keeps only the short summary; full details live in the modal.
+        const flags = d.flags || {};
+        const flagBits = [];
+        if (flags.block_in === 'off') flagBits.push(_('rknblock_opt_block_in_short'));
+        if (flags.block_out === 'off') flagBits.push(_('rknblock_opt_block_out_short'));
+        if (flags.log_in === 'off' || flags.log_out === 'off') flagBits.push(_('rknblock_opt_log_off_short'));
+        grid.innerHTML = `
+            <div class="text-sm">${_('rkn_block_agent')}: ${escapeHtml(d.agent_state)} •
+                ${_('rkn_block_lists')}: ${_('rkn_block_in_short')} ${inN}, ${_('rkn_block_out_short')} ${outN}` +
+                (setsEmpty ? ` ⚠️ ${_('rkn_block_sets_empty')}` : '') +
+                (flagBits.length ? ` • ⚠️ ${_('rknblock_disabled_short')}: ${escapeHtml(flagBits.join(', '))}` : '') + `</div>`;
+        infoEl.classList.remove('hidden');
+        if (location.hash === '#proto-rknblock') {
+            setTimeout(() => card.scrollIntoView({ behavior: 'smooth', block: 'center' }), 300);
+        }
+    }
+
+    // Full per-org / per-port / recent-event breakdown of the scan log.
+    function renderRknScansModal() {
+        const d = rknBlockStatus;
+        const body = document.getElementById('rknblock-modal-body');
+        if (!body) return;
+        if (!d || !d.installed) {
+            body.innerHTML = `<div class="form-hint">${_('rkn_block_none')}</div>`;
+            return;
+        }
+        const orgRows = (d.by_org || []).map(([org, n]) =>
+            `<tr><td style="padding:2px 12px 2px 0;">${escapeHtml(org)}</td><td>${n}</td></tr>`).join('');
+        const dptRows = (d.by_dpt || []).map(([p, n]) =>
+            `<tr><td style="padding:2px 12px 2px 0;">${svcName(p)}</td><td>${n}</td></tr>`).join('');
+        const dir = d.by_dir || {};
+        const recentRows = (d.recent || []).map(ev => {
+            const t = ev.t ? new Date(ev.t).toLocaleString() : '';
+            return `<tr><td style="padding:2px 12px 2px 0;">${escapeHtml(t)}</td>` +
+                `<td style="padding:2px 12px 2px 0;">${escapeHtml(ev.ip || '')}</td>` +
+                `<td style="padding:2px 12px 2px 0;">${escapeHtml(ev.org || '?')}</td>` +
+                `<td>${svcName(ev.dpt)}</td></tr>`;
+        }).join('');
+        body.innerHTML = `
+            ${orgRows || dptRows ? `
+            <div class="flex gap-md flex-wrap">
+                ${orgRows ? `<div><div class="text-muted">${_('rkn_block_who')}</div><table>${orgRows}</table></div>` : ''}
+                ${dptRows ? `<div><div class="text-muted">${_('rkn_block_ports')}</div><table>${dptRows}</table></div>` : ''}
+            </div>` : `<div class="text-muted text-sm">${_('rkn_block_none')}</div>`}
+            <div class="text-muted text-sm mt-sm">${_('rkn_block_dirs')}: in ${dir.in || 0} / out ${dir.out || 0}
+                • ${_('rkn_block_total')}: ${d.total_events}
+                ${d.last_event ? ' • ' + escapeHtml(d.last_event) : ''}</div>
+            ${recentRows ? `<div class="mt-sm"><div class="text-muted">${_('rkn_block_recent')}</div>
+                <table>${recentRows}</table></div>` : ''}
+            <div class="form-hint mt-sm">${_('rkn_block_legend')}</div>`;
+    }
+
+    function openRknScansModal() {
+        if (!rknBlockStatus) return;
+        renderRknScansModal();
+        openModal('rknScansModal');
+    }
+
+    const RKN_OPTION_FIELDS = ['block_in', 'block_out', 'log_in', 'log_out'];
+
+    function rknFlagOn(name) {
+        const f = (rknBlockStatus && rknBlockStatus.flags) || {};
+        return f[name] !== 'off';
+    }
+
+    function openRknOptionsModal() {
+        if (!rknBlockStatus || !rknBlockStatus.installed) return;
+        RKN_OPTION_FIELDS.forEach(name => {
+            const el = document.getElementById('rknOpt' + name.replace(/(^|_)([a-z])/g,
+                (m, u, c) => c.toUpperCase()));
+            if (el) el.checked = rknFlagOn(name);
+        });
+        openModal('rknOptionsModal');
+    }
+
+    async function saveRknOptions() {
+        const body = {};
+        RKN_OPTION_FIELDS.forEach(name => {
+            const el = document.getElementById('rknOpt' + name.replace(/(^|_)([a-z])/g,
+                (m, u, c) => c.toUpperCase()));
+            body[name] = !!(el && el.checked);
+        });
+        const btn = document.getElementById('rknOptionsSaveBtn');
+        if (btn) btn.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/rknblock/options`, 'POST', body);
+            closeModal('rknOptionsModal');
+            showToast(_('rknblock_opts_saved'), 'success');
+            await loadRknBlock();
+        } catch (e) {
+            showToast(`${_('rknblock_options')}: ${e.message || e}`, 'error');
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    // Host-level install with the same progress UX as protocol installs:
+    // the shared installModal switches to progress-only mode (form hidden).
+    async function installRknBlock() {
+        closeModal('marketplaceModal');
+        const btn = document.getElementById('rknblock-install-btn');
+        if (btn) btn.disabled = true;
+        const titleEl = document.getElementById('installModalTitle');
+        if (titleEl) titleEl.textContent = 'RKN Block (C24Be)';
+        document.getElementById('installForm').classList.add('hidden');
+        document.getElementById('installDone').style.display = 'none';
+        const progressDiv = document.getElementById('installProgress');
+        progressDiv.classList.remove('hidden');
+        const logEl = document.getElementById('installLog');
+        const fillEl = document.getElementById('installProgressFill');
+        fillEl.style.width = '10%';
+        fillEl.style.background = '';
+        logEl.innerHTML = `<div class="log-line info">${_('install_starting')}</div>`;
+        openModal('installModal');
+        const steps = [
+            { pct: 25, msg: _('rknblock_step_download') },
+            { pct: 45, msg: _('rknblock_step_sets') },
+            { pct: 65, msg: _('rknblock_step_rules') },
+            { pct: 85, msg: _('rknblock_step_agent') },
+        ];
+        let stepIdx = 0;
+        const progressInterval = setInterval(() => {
+            if (stepIdx < steps.length) {
+                fillEl.style.width = steps[stepIdx].pct + '%';
+                logEl.innerHTML += `<div class="log-line info">${steps[stepIdx].msg}</div>`;
+                logEl.scrollTop = logEl.scrollHeight;
+                stepIdx++;
+            }
+        }, 1500);
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/rknblock/install`, 'POST');
+            clearInterval(progressInterval);
+            fillEl.style.width = '100%';
+            fillEl.style.background = 'var(--success, #4ade80)';
+            logEl.innerHTML += `<div class="log-line success">✓ ${_('rknblock_installed_toast')}</div>`;
+            logEl.scrollTop = logEl.scrollHeight;
+            showToast(_('rknblock_installed_toast'), 'success');
+            await loadRknBlock();
+            applyInstalledAppsVisibility();
+            renderMarketplace();
+            document.getElementById('installDone').style.display = '';
+        } catch (err) {
+            clearInterval(progressInterval);
+            fillEl.style.background = 'var(--danger, #f85149)';
+            logEl.innerHTML += `<div class="log-line error">${_('error')}: ${escapeHtml(err.message || err)}</div>`;
+            logEl.scrollTop = logEl.scrollHeight;
+            showToast(_('error') + ': ' + (err.message || err), 'error');
+            document.getElementById('installDone').style.display = '';
+        } finally {
+            if (btn) btn.disabled = false;
+        }
+    }
+
+    async function uninstallRknBlock() {
+        if (!confirm(_('rknblock_uninstall_confirm'))) return;
+        const btn = document.getElementById('rknblock-uninstall-btn');
+        btn.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/rknblock/uninstall`, 'POST');
+            showToast(_('rknblock_uninstalled_toast'), 'success');
+            await loadRknBlock();
+            applyInstalledAppsVisibility();
+            renderMarketplace();
+        } catch (err) {
+            showToast(_('error') + ': ' + (err.message || err), 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function toggleRknBlockApp(enable) {
+        const btn = document.getElementById('rknblock-toggle-btn');
+        btn.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/rknblock/enable`, 'POST', { enabled: !!enable });
+            showToast(_(enable ? 'rknblock_started_toast' : 'rknblock_stopped_toast'), 'success');
+            await loadRknBlock();
+        } catch (err) {
+            showToast(_('error') + ': ' + (err.message || err), 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function updateRknBlockLists() {
+        const btn = document.getElementById('rknblock-update-btn');
+        btn.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/rknblock/update`, 'POST');
+            showToast(_('rknblock_updated_toast'), 'success');
+            await loadRknBlock();
+        } catch (err) {
+            showToast(_('error') + ': ' + (err.message || err), 'error');
+        } finally {
+            btn.disabled = false;
+        }
+    }
+
+    async function clearRknScans() {
+        if (!confirm(_('rkn_block_clear_confirm'))) return;
+        const btn = document.getElementById('rknClearBtn');
+        btn.disabled = true;
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/rkn_scans/clear`, 'POST', {});
+            await loadRknBlock();
+            showToast(_('rkn_block_cleared'), 'success');
+        } catch (err) {
+            showToast(_('error') + ': ' + (err.message || err), 'error');
+        } finally {
+            btn.disabled = false;
         }
     }
 
