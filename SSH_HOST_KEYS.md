@@ -1,6 +1,6 @@
 # Trusted SSH host keys
 
-## v1.7.9 — web enrollment and migration
+## v1.7.8 — web enrollment and migration
 
 Administrators can open a server page and use **SSH host key → Inspect SSH key**,
 including when statistics/protocol loading fails. Unknown and changed keys have
