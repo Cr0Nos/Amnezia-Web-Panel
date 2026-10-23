@@ -298,6 +298,9 @@ class OnboardingTests(unittest.TestCase):
     def test_edit_stale_uid_and_missing_inventory_draft_rejected(self):
         self.write([self.server])
         self.assertEqual(self.inspect(dict(self.endpoint, server_uid='missing')).status_code, 409)
+        self.assertEqual(self.client.post('/api/servers/0/ssh-trust/inspect?server_uid=stale').status_code, 409)
+        self.assertEqual(self.client.post('/api/servers/0/ssh-trust/confirm?server_uid=stale',
+                         json={'token': 'unused', 'confirmed': True}).status_code, 409)
         with mock.patch.object(self.app, 'SSHManager') as manager:
             result = self.client.post('/api/servers/0/edit?server_uid=other', json=self.endpoint)
             self.assertEqual(result.status_code, 409)

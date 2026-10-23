@@ -3226,12 +3226,14 @@ def _ssh_trust_admin(request):
 
 
 @app.post('/api/servers/{server_id}/ssh-trust/inspect', tags=["Servers"])
-def api_ssh_trust_inspect(request: Request, server_id: int):
+def api_ssh_trust_inspect(request: Request, server_id: int, server_uid: Optional[str] = None):
     if not _ssh_trust_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     servers = load_data()['servers']
     if not 0 <= server_id < len(servers):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
+    if server_uid is not None and servers[server_id].get('uid') != server_uid:
+        return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
     try:
         return ssh_trust.inspect(servers[server_id])
     except Exception as exc:
@@ -3274,7 +3276,8 @@ async def _save_ssh_confirmation(endpoint, token, key, unchanged, reset_server):
 
 
 @app.post('/api/servers/{server_id}/ssh-trust/confirm', tags=["Servers"])
-async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
+async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation,
+                                server_uid: Optional[str] = None):
     if not _ssh_trust_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     if not req.confirmed:
@@ -3283,6 +3286,8 @@ async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustC
     if not 0 <= server_id < len(servers):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     server = servers[server_id]
+    if server_uid is not None and server.get('uid') != server_uid:
+        return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
     try:
         key = await asyncio.to_thread(ssh_trust.prepare_enrollment, server, req.token)
         def unchanged():
