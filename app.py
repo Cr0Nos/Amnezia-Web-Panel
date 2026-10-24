@@ -32,7 +32,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictBool, constr
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -43,6 +43,7 @@ except ImportError:
     CaptchaGenerator = None
 
 from managers.ssh_manager import SSHManager
+from managers import ssh_trust
 from managers.awg_manager import AWGManager, normalize_special_junk
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
@@ -202,7 +203,8 @@ else:
 DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
-CURRENT_VERSION = "v1.7.7"
+ssh_trust.configure(DATA_FILE)
+CURRENT_VERSION = "v1.7.9"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -313,6 +315,10 @@ def load_data():
         self_service.setdefault(key, value)
     for server in data.get('servers', []):
         server.setdefault('self_service_enabled', False)
+        # Legacy RKN toggle: the blocking contour is now a marketplace app
+        # (server['rknblock']). The old flag is dropped so every server shows
+        # "not installed" until the app is installed from the store.
+        server.pop('rkn_block_enabled', None)
     return data
 
 
@@ -3173,6 +3179,86 @@ def _check_admin(request):
     return None
 
 
+class SSHTrustConfirmation(BaseModel):
+    token: constr(min_length=1, max_length=4096)
+    confirmed: StrictBool
+
+
+def _ssh_trust_admin(request):
+    # Keep session/Bearer authorization; reject cross-origin browser writes.
+    origin = request.headers.get('origin')
+    fetch_site = request.headers.get('sec-fetch-site')
+    # Modern browsers supply unforgeable-by-JS same-origin metadata even
+    # behind TLS-terminating proxies. Do not trust arbitrary Forwarded headers.
+    if origin and fetch_site != 'same-origin' and origin.rstrip('/') != str(request.base_url).rstrip('/'):
+        return False
+    if fetch_site in ('cross-site', 'same-site'):
+        return False
+    user = _check_admin(request)
+    return bool(user and user['role'] == 'admin')
+
+
+@app.post('/api/servers/{server_id}/ssh-trust/inspect', tags=["Servers"])
+def api_ssh_trust_inspect(request: Request, server_id: int):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    try:
+        return ssh_trust.inspect(servers[server_id])
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
+async def _finish_locked_worker(function):
+    """Do not release a caller's lock while its worker can still mutate state."""
+    worker = asyncio.create_task(asyncio.to_thread(function))
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        # Retrieve any worker exception, but preserve the request cancellation.
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
+
+
+@app.post('/api/servers/{server_id}/ssh-trust/confirm', tags=["Servers"])
+async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.confirmed:
+        return JSONResponse({'error': 'Explicit confirmation required'}, status_code=400)
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = servers[server_id]
+    try:
+        def unchanged():
+            current = load_data()['servers']
+            return (server_id < len(current) and
+                    all(current[server_id].get(k) == server.get(k)
+                        for k in ('uid', 'host', 'ssh_port')))
+        # Serialize the final endpoint check and trust write with server edits.
+        async with DATA_LOCK:
+            def enroll_and_reset():
+                result = ssh_trust.enroll(server, req.token, validate_endpoint=unchanged)
+                drop_ssh(server)
+                return result
+
+            result = await _finish_locked_worker(enroll_and_reset)
+        return result
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
 @app.post('/api/servers/add', tags=["Servers"])
 def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
@@ -3211,61 +3297,65 @@ def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
-def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
+async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
     """Update connection details for an existing server entry. Verifies the new
     credentials by SSH-connecting before persisting, so a typo can't lock us out.
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-
-        new_host = (req.host or '').strip() or server['host']
-        new_user = (req.username or '').strip() or server['username']
-        new_port = int(req.ssh_port or server.get('ssh_port', 22))
-        new_name = (req.name or '').strip() or server.get('name') or new_host
-
-        # Credential resolution: a non-empty value in either field switches to
-        # that auth method (and clears the other). Both omitted => keep current.
-        if req.private_key:
-            new_pass, new_key = '', req.private_key
-        elif req.password:
-            new_pass, new_key = req.password, ''
-        else:
-            new_pass = server.get('password', '')
-            new_key = server.get('private_key', '')
-
-        if not new_pass and not new_key:
-            return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
-
-        # Verify the new connection details before committing the change.
-        ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+    def edit():
         try:
-            ssh.connect()
-            server_info = ssh.test_connection()
-            ssh.disconnect()
-        except Exception as e:
-            return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+            data = load_data()
+            if server_id >= len(data['servers']):
+                return JSONResponse({'error': 'Server not found'}, status_code=404)
+            server = data['servers'][server_id]
 
-        server['name'] = new_name
-        server['host'] = new_host
-        server['ssh_port'] = new_port
-        server['username'] = new_user
-        server['password'] = new_pass
-        server['private_key'] = new_key
-        server['server_info'] = server_info
-        if req.self_service_enabled is not None:
-            server['self_service_enabled'] = bool(req.self_service_enabled)
-        save_data(data)
-        # Drop the stale pooled connection: credentials/host may have changed.
-        drop_ssh(server)
-        return {'status': 'success', 'server_info': server_info}
-    except Exception as e:
-        logger.exception("Error editing server")
-        return JSONResponse({'error': str(e)}, status_code=500)
+            new_host = (req.host or '').strip() or server['host']
+            new_user = (req.username or '').strip() or server['username']
+            new_port = int(req.ssh_port or server.get('ssh_port', 22))
+            new_name = (req.name or '').strip() or server.get('name') or new_host
+
+            # Credential resolution: a non-empty value in either field switches to
+            # that auth method (and clears the other). Both omitted => keep current.
+            if req.private_key:
+                new_pass, new_key = '', req.private_key
+            elif req.password:
+                new_pass, new_key = req.password, ''
+            else:
+                new_pass = server.get('password', '')
+                new_key = server.get('private_key', '')
+
+            if not new_pass and not new_key:
+                return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
+
+            # Verify the new connection details before committing the change.
+            ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+            try:
+                ssh.connect()
+                server_info = ssh.test_connection()
+                ssh.disconnect()
+            except Exception as e:
+                return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+
+            server['name'] = new_name
+            server['host'] = new_host
+            server['ssh_port'] = new_port
+            server['username'] = new_user
+            server['password'] = new_pass
+            server['private_key'] = new_key
+            server['server_info'] = server_info
+            if req.self_service_enabled is not None:
+                server['self_service_enabled'] = bool(req.self_service_enabled)
+            save_data(data)
+            # Drop the stale pooled connection: credentials/host may have changed.
+            drop_ssh(server)
+            return {'status': 'success', 'server_info': server_info}
+        except Exception as e:
+            logger.exception("Error editing server")
+            return JSONResponse({'error': str(e)}, status_code=500)
+
+    async with DATA_LOCK:
+        return await _finish_locked_worker(edit)
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])
@@ -3295,7 +3385,11 @@ async def api_server_ping(request: Request, server_id: int):
             await writer.wait_closed()
         except Exception:
             pass
-        return {'alive': True, 'ms': ms}
+        try:
+            trust = await asyncio.to_thread(ssh_trust.saved_status, server)
+            return {'alive': True, 'ms': ms, 'ssh_trust': trust, 'ssh_verified': False}
+        except Exception:
+            return {'alive': True, 'ms': ms, 'ssh_trust': 'error'}
     except asyncio.TimeoutError:
         return {'alive': False, 'error': 'timeout', 'ms': None}
     except Exception as e:
@@ -3352,20 +3446,21 @@ async def api_delete_server(request: Request, server_id: int):
             await exit_link_svc.forget_entry_peers(server)
         except Exception as e:
             logger.warning(f"exit-link cleanup before delete failed: {e}")
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-        await asyncio.to_thread(drop_ssh, server)
-        data['servers'].pop(server_id)
-        # Clean up connections for this server
-        data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
-        # Adjust server_ids for connections pointing to higher indices
-        for c in data.get('user_connections', []):
-            if c.get('server_id', 0) > server_id:
-                c['server_id'] -= 1
-        save_data(data)
-        return {'status': 'success'}
+        async with DATA_LOCK:
+            data = load_data()
+            if server_id >= len(data['servers']):
+                return JSONResponse({'error': 'Server not found'}, status_code=404)
+            server = data['servers'][server_id]
+            await _finish_locked_worker(lambda: drop_ssh(server))
+            data['servers'].pop(server_id)
+            # Clean up connections for this server
+            data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
+            # Adjust server_ids for connections pointing to higher indices
+            for c in data.get('user_connections', []):
+                if c.get('server_id', 0) > server_id:
+                    c['server_id'] -= 1
+            save_data(data)
+            return {'status': 'success'}
     except Exception as e:
         return JSONResponse({'error': str(e)}, status_code=500)
 
@@ -3504,6 +3599,348 @@ def api_server_stats(request: Request, server_id: int):
     except Exception as e:
         logger.exception("Error getting server stats")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+RKN_RAW_BASE = ('https://raw.githubusercontent.com/PRVTPRO/Amnezia-Web-Panel/'
+                'main/scripts/rknblock')
+
+RKN_INSTALL_CMD = (
+    f'curl -fsSL {RKN_RAW_BASE}/install-rkn-extra.sh '
+    '-o /tmp/rkn-install.sh && bash /tmp/rkn-install.sh'
+)
+
+RKN_SCRIPT_URL = f'{RKN_RAW_BASE}/rkn-extra-block.sh'
+
+
+def _rkn_run_cmd(subcommand):
+    """Fetch the current script to /tmp, refresh the host copy, run a subcommand.
+
+    Server-side copies may predate newer subcommands (`uninstall`, `set`);
+    always driving a fresh copy keeps every server able to run every
+    subcommand regardless of the version it was installed with.
+    """
+    return (f'curl -fsSL {RKN_SCRIPT_URL} -o /tmp/rkn-extra-block-run.sh '
+            f'&& install -m 0755 /tmp/rkn-extra-block-run.sh /usr/local/sbin/rkn-extra-block '
+            f'&& bash /tmp/rkn-extra-block-run.sh {subcommand}; '
+            f'rc=$?; rm -f /tmp/rkn-extra-block-run.sh; exit $rc')
+
+
+def _rkn_record(server):
+    return server.get('rknblock') or {}
+
+
+async def _rkn_ssh_run(server, cmd, timeout):
+    ssh = await asyncio.to_thread(get_ssh, server)
+    await asyncio.to_thread(ssh.connect)
+    try:
+        out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd, timeout)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    if code != 0:
+        return JSONResponse({'error': f'command failed: {(err or out or "").strip()[-500:]}'},
+                            status_code=500)
+    return None
+
+
+@app.post('/api/servers/{server_id}/rknblock/install', tags=["Servers"])
+async def api_rknblock_install(request: Request, server_id: int):
+    """Install the RKN/VK network blocking app (rkn-extra-block contour)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    err = await _rkn_ssh_run(server, RKN_INSTALL_CMD, 420)
+    if err is not None:
+        return err
+    rec = dict(_rkn_record(server))
+    rec['installed'] = True
+    rec['enabled'] = True
+    server['rknblock'] = rec
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'installed': True, 'enabled': True}
+
+
+@app.post('/api/servers/{server_id}/rknblock/uninstall', tags=["Servers"])
+async def api_rknblock_uninstall(request: Request, server_id: int):
+    """Fully remove the blocking contour: rules, sets, units, scripts, logs."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    err = await _rkn_ssh_run(server, _rkn_run_cmd('uninstall'), 180)
+    if err is not None:
+        return err
+    server.pop('rknblock', None)
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'installed': False}
+
+
+class RknBlockEnableRequest(BaseModel):
+    enabled: bool = True
+
+
+@app.post('/api/servers/{server_id}/rknblock/enable', tags=["Servers"])
+async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEnableRequest):
+    """Start or stop the blocking contour (rules jump in/out; lists stay)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    err = await _rkn_ssh_run(server, _rkn_run_cmd('on' if req.enabled else 'off'), 180)
+    if err is not None:
+        return err
+    rec = dict(_rkn_record(server))
+    rec['installed'] = True
+    rec['enabled'] = bool(req.enabled)
+    server['rknblock'] = rec
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'enabled': bool(req.enabled)}
+
+
+@app.post('/api/servers/{server_id}/rknblock/update', tags=["Servers"])
+async def api_rknblock_update(request: Request, server_id: int):
+    """Re-download the C24Be lists and atomically reload the ipset sets."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    err = await _rkn_ssh_run(server, _rkn_run_cmd('update'), 300)
+    if err is not None:
+        return err
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'updated': True}
+
+
+RKN_OPTION_FLAGS = ('block_in', 'block_out', 'log_in', 'log_out')
+
+
+class RknBlockOptionsRequest(BaseModel):
+    block_in: bool = True
+    block_out: bool = True
+    log_in: bool = True
+    log_out: bool = True
+
+
+@app.post('/api/servers/{server_id}/rknblock/options', tags=["Servers"])
+async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOptionsRequest):
+    """Set per-direction block/log flags on the host contour (chains rebuilt only)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    if not _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    values = req.model_dump()
+    pairs = ' '.join(f'{k}={"on" if values[k] else "off"}' for k in RKN_OPTION_FLAGS)
+    err = await _rkn_ssh_run(server, _rkn_run_cmd(f'set {pairs}'), 120)
+    if err is not None:
+        return err
+    rec = dict(_rkn_record(server))
+    rec['installed'] = True
+    rec['flags'] = values
+    server['rknblock'] = rec
+    save_data(data)
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'success', 'flags': values}
+
+
+RKN_SCAN_SSH_CMD = ("rkn-extra-block status 2>/dev/null | head -10; "
+                      "echo '===LOG==='; tail -n 2000 /var/log/rkn-scans.json 2>/dev/null")
+
+
+def _parse_rkn_scan_output(out, flag_enabled):
+    """Parse `rkn-extra-block status` + rkn-scans.json tail into a summary dict."""
+    agent_state = 'unknown'
+    log_part = ''
+    status_part = ''
+    if '===LOG===' in (out or ''):
+        status_part, log_part = out.split('===LOG===', 1)
+        first_line = status_part.strip().splitlines()[0] if status_part.strip() else ''
+        if ':' in first_line:
+            agent_state = first_line.split(':', 1)[1].strip()
+    # Наполненность наборов из cmd_status: "входящие...: v4=N сетей v6=M сетей"
+    sets = {'in4': 0, 'in6': 0, 'out4': 0, 'out6': 0}
+    counts = re.findall(r'v[46]=(\d+)', status_part)
+    if len(counts) >= 4:
+        sets = dict(zip(('in4', 'in6', 'out4', 'out6'), (int(c) for c in counts[:4])))
+    # Флаги направлений из строки "flags: block_in=on block_out=on log_in=on log_out=on"
+    flags = {}
+    m = re.search(r'flags:\s*([^\n]+)', status_part)
+    if m:
+        for kv in m.group(1).split():
+            if '=' in kv:
+                k, v = kv.split('=', 1)
+                flags[k.strip()] = v.strip()
+    # Дата последнего обновления баз из строки "last_update: 2026-10-16T12:00:00Z"
+    last_update = None
+    m = re.search(r'last_update:\s*(\S+)', status_part)
+    if m and m.group(1) != '—':
+        last_update = m.group(1)
+    events = []
+    for line in (log_part or '').splitlines():
+        line = line.strip()
+        if not line.startswith('{'):
+            continue
+        try:
+            ev = json.loads(line)
+            if isinstance(ev, dict) and 't' in ev:
+                events.append(ev)
+        except ValueError:
+            continue
+
+    now = datetime.now(timezone.utc)
+    day_ago = now - timedelta(hours=24)
+    by_org, by_dpt, by_dir = {}, {}, {}
+    last_24h = 0
+    last_ts = None
+    for ev in events:
+        org = str(ev.get('org') or '?')
+        by_org[org] = by_org.get(org, 0) + 1
+        dpt = ev.get('dpt', 0)
+        by_dpt[dpt] = by_dpt.get(dpt, 0) + 1
+        direction = ev.get('dir', '?')
+        by_dir[direction] = by_dir.get(direction, 0) + 1
+        try:
+            ts = datetime.fromisoformat(str(ev['t']).replace('Z', '+00:00'))
+            if ts >= day_ago:
+                last_24h += 1
+            if last_ts is None or ts > last_ts:
+                last_ts = ts
+        except ValueError:
+            pass
+
+    return {
+        'flag_enabled': bool(flag_enabled),
+        'agent_state': agent_state,
+        'sets': sets,
+        'flags': flags,
+        'last_update': last_update,
+        'total_events': len(events),
+        'last_24h': last_24h,
+        'last_event': last_ts.isoformat() if last_ts else None,
+        'by_org': sorted(by_org.items(), key=lambda kv: -kv[1])[:10],
+        'by_dpt': sorted(by_dpt.items(), key=lambda kv: -kv[1])[:10],
+        'by_dir': by_dir,
+        'recent': events[-5:][::-1],
+    }
+
+
+async def _fetch_rkn_scan_output(server):
+    """SSH to a server and fetch the rkn-extra-block status line + scan log tail."""
+    ssh = await asyncio.to_thread(get_ssh, server)
+    await asyncio.to_thread(ssh.connect)
+    try:
+        out, _, _ = await asyncio.to_thread(ssh.run_sudo_command, RKN_SCAN_SSH_CMD, 60)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    return out
+
+
+@app.get('/api/servers/{server_id}/rkn_scans', tags=["Servers"])
+async def api_rkn_scans(request: Request, server_id: int):
+    """Compact scan statistics collected hourly by rkn-agent on the server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    out = await _fetch_rkn_scan_output(server)
+    record = server.get('rknblock') or {}
+    installed = bool(record.get('installed'))
+    parsed = _parse_rkn_scan_output(out, installed)
+    parsed['installed'] = installed
+    parsed['enabled'] = bool(record.get('enabled', True)) if installed else False
+    return parsed
+
+
+@app.post('/api/servers/{server_id}/rkn_scans/clear', tags=["Servers"])
+async def api_rkn_scans_clear(request: Request, server_id: int):
+    """Truncate the remote rkn-scans.json so the admin can acknowledge sightings."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    ssh = await asyncio.to_thread(get_ssh, server)
+    await asyncio.to_thread(ssh.connect)
+    try:
+        # Новые версии: переносят горизонт сбора (старое не подхватится агентом).
+        # Старые: просто обнулят файл — событие вернётся после часового прогона агента.
+        await asyncio.to_thread(
+            ssh.run_sudo_command,
+            'rkn-extra-block clearscans 2>/dev/null || : > /var/log/rkn-scans.json', 30)
+    finally:
+        try:
+            ssh.disconnect()
+        except Exception:
+            pass
+    RKN_FLAG_CACHE.pop(server_id, None)
+    return {'status': 'cleared'}
+
+
+RKN_FLAG_CACHE = {}
+RKN_FLAG_CACHE_TTL = 900  # seconds; scan flags on the overview page
+
+
+@app.get('/api/servers/rkn_scan_flags', tags=["Servers"])
+async def api_rkn_scan_flags(request: Request):
+    """Lightweight per-server scan flags for the servers overview page.
+
+    Returns {server_id: {agent_state, events24, last, flag}} for servers whose
+    rkn-agent responded. Results are cached for RKN_FLAG_CACHE_TTL seconds so
+    the overview page doesn't SSH into every server on each load.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    data = load_data()
+    now = time.time()
+
+    async def collect(idx, srv):
+        cached = RKN_FLAG_CACHE.get(idx)
+        if cached and now - cached['ts'] < RKN_FLAG_CACHE_TTL:
+            return idx, cached['data']
+        try:
+            out = await _fetch_rkn_scan_output(srv)
+            parsed = _parse_rkn_scan_output(out, srv.get('rkn_block_enabled', False))
+            summary = {'agent_state': parsed['agent_state'],
+                       'events24': parsed['last_24h'],
+                       'last': parsed['last_event'],
+                       'flag': parsed['flag_enabled'],
+                       'installed': parsed['flag_enabled'],
+                       'sets': parsed['sets']}
+        except Exception:
+            summary = None
+        RKN_FLAG_CACHE[idx] = {'ts': now, 'data': summary}
+        return idx, summary
+
+    results = await asyncio.gather(
+        *[collect(i, s) for i, s in enumerate(data['servers'])])
+    return {str(i): s for i, s in results if s}
 
 
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
