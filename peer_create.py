@@ -123,7 +123,7 @@ class PeerCreateService:
                 private, public = generate_wg_keypair()
                 operation = dict(id=op_id, identity=identity, private=private, public=public,
                                  access=access_signature(user), phase='intent',
-                                 endpoint=[server.get(k) for k in ('host', 'port', 'username')])
+                                 endpoint=[server.get('host'), server.get('ssh_port', 22), server.get('username')])
                 self.journal.put(operation)
         return await self.resume(op_id)
 
@@ -160,7 +160,7 @@ class PeerCreateService:
         if len(matches) != 1:
             raise PeerCreateError('Server identity changed; recovery required', 409, operation['id'])
         sid, server = matches[0]
-        if ([server.get(k) for k in ('host', 'port', 'username')] != operation['endpoint']
+        if ([server.get('host'), server.get('ssh_port', 22), server.get('username')] != operation['endpoint']
                 or protocol not in server.get('protocols', {})):
             raise PeerCreateError('Server endpoint changed; recovery required', 409, operation['id'])
         user = next((u for u in data.get('users', []) if u['id'] == user_id), None)

@@ -295,6 +295,15 @@ class AdminCreateLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await task).status_code, 409)
         self.assert_inactive()
 
+    async def test_ssh_port_change_is_part_of_endpoint_identity(self):
+        self.remote.release.clear()
+        task = asyncio.create_task(self.create())
+        await self.wait_for(self.remote.entered)
+        self.data['servers'][0]['ssh_port'] = 2222
+        self.remote.release.set()
+        self.assertEqual((await task).status_code, 409)
+        self.assert_inactive()
+
     async def test_expired_and_quota_blocked_users_fail_before_remote_action(self):
         for fields in ({'expiration_date': '2020-01-01T00:00:00'},
                        {'traffic_limit': 10, 'traffic_used': 10},
