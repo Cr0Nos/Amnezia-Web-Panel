@@ -20,6 +20,25 @@ class TrafficFinalizationRequired(RuntimeError):
         super().__init__(FINALIZATION_MESSAGE)
 
 
+def _protocol_scope(protocol):
+    """Match the container actually selected by the protocol managers.
+
+    Their first-instance and invalid suffix aliases must not bypass a guard;
+    the WireGuard manager always selects its single container.
+    """
+    parts = str(protocol or 'awg').split('__', 1)
+    base = parts[0]
+    multi = {'awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'socks5'}
+    single = {'wireguard', 'dns', 'adguard', 'nginx', 'exit'}
+    if base not in multi | single:
+        base = 'awg'  # Matches the manager dispatcher's AWG fallback.
+    try:
+        index = max(1, int(parts[1])) if len(parts) == 2 and base in multi else 1
+    except ValueError:
+        index = 1
+    return base, index
+
+
 def require_unowned(data, *, server_id=None, protocol=None, client_id=None,
                     user_ids=None):
     """Reject a destructive scope containing any accounting ownership record.
@@ -30,7 +49,7 @@ def require_unowned(data, *, server_id=None, protocol=None, client_id=None,
     for conn in data.get('user_connections', []):
         if server_id is not None and conn.get('server_id') != server_id:
             continue
-        if protocol is not None and conn.get('protocol') != protocol:
+        if protocol is not None and _protocol_scope(conn.get('protocol')) != _protocol_scope(protocol):
             continue
         if client_id is not None and conn.get('client_id') != client_id:
             continue

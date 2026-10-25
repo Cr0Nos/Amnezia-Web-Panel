@@ -129,6 +129,12 @@ class DestructiveAccountingGuards(unittest.IsolatedAsyncioTestCase):
             panel.ConnectionActionRequest(protocol='awg3', client_id='peer'))).status_code, 404)
         self.ssh.assert_not_called()
 
+    async def test_same_container_protocol_alias_cannot_bypass_guard(self):
+        for protocol in ('awg3__1', 'awg3__0', 'awg3__bad'):
+            with self.subTest(protocol=protocol):
+                self.rejected(await panel.api_remove_connection(self.request, 0,
+                    panel.ConnectionActionRequest(protocol=protocol, client_id='peer')))
+
     async def test_self_service_delete_cannot_drop_baselines(self):
         data = fixtures.base_data()
         data['user_connections'] = [dict(id='self', user_id='user-1', server_id=0,
@@ -249,3 +255,13 @@ class ScopeMatching(unittest.TestCase):
             require_unowned(data, **scope)
         with self.assertRaises(TrafficFinalizationRequired):
             require_unowned(data, user_ids={'u'})
+
+    def test_physical_instance_aliases_preserve_separate_instances(self):
+        data = state()
+        data['user_connections'][0]['protocol'] = 'awg3__2'
+        with self.assertRaises(TrafficFinalizationRequired):
+            require_unowned(data, protocol='awg3__02')
+        require_unowned(data, protocol='awg3')
+        data['user_connections'][0]['protocol'] = 'wireguard'
+        with self.assertRaises(TrafficFinalizationRequired):
+            require_unowned(data, protocol='wireguard__2')
