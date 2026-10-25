@@ -204,6 +204,16 @@ The bundled `docker-compose.yml` sets `DATA_FILE=/app/data/data.json` so panel s
 for the full list of knobs.
 
 
+
+AWG connections created through the admin user-connection endpoint also use
+`<DATA_FILE>.peer-creates.json`. Keep this mode-0600 operation journal on the
+same persistent volume and include it in filesystem backups alongside `data.json`.
+It contains private key material; do not publish it. The JSON settings export is
+not a substitute for this backup. Run one panel process, as required by the
+in-process mutation/data locks. Retry the same `operation_id` after an uncertain
+response; the standard user-connection dialog retains it until success.
+
+
 ### Initial Login
 *   **Username**: `admin`
 *   **Password**: `admin`

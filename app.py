@@ -258,6 +258,8 @@ load_translations()
 # ======================== Helpers ========================
 
 # Global lock for data.json access to prevent race conditions during async operations
+from peer_lifecycle_lock import serialize_peer_lifecycle
+
 DATA_LOCK = asyncio.Lock()
 
 
@@ -1668,6 +1670,17 @@ def config_payloads(config_text, server=None, protocol=None):
     }
 
 
+from peer_create import PeerCreateService, PeerCreateError
+
+peer_creates = PeerCreateService(
+    path=lambda: DATA_FILE + '.peer-creates.json',
+    load_data=lambda: load_data(), save_data=lambda data: save_data(data),
+    data_lock=DATA_LOCK, get_ssh=lambda server: get_ssh(server),
+    get_manager=lambda ssh, protocol: get_protocol_manager(ssh, protocol),
+    public_endpoint=lambda server, protocol: protocol_public_endpoint(server, protocol),
+)
+
+
 self_service_connections = ConnectionService(
     load_data=load_data,
     save_data=save_data,
@@ -1852,6 +1865,7 @@ async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
     return True
 
 
+@serialize_peer_lifecycle
 async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: List[tuple] = None, create_conns: List[dict] = None):
     """
     Executes multiple SSH operations efficiently.
@@ -2539,6 +2553,7 @@ class AddUserConnectionRequest(BaseModel):
     protocol: str = 'awg'
     name: str = 'VPN Connection'
     client_id: Optional[str] = None
+    operation_id: Optional[str] = None
     telemt_quota: Optional[str] = None
     telemt_max_ips: Optional[int] = None
     telemt_expiry: Optional[str] = None
@@ -2861,6 +2876,7 @@ async def periodic_background_tasks():
     """Background task to sync traffic limits and Remnawave every 10 minutes"""
     while True:
         try:
+            await peer_creates.recover()
             # We wait before the first sync to let the app settle
             await asyncio.sleep(60) 
             
@@ -3226,6 +3242,7 @@ async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustC
 
 
 @app.post('/api/servers/add', tags=["Servers"])
+@serialize_peer_lifecycle
 def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3263,6 +3280,7 @@ def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
     """Update connection details for an existing server entry. Verifies the new
     credentials by SSH-connecting before persisting, so a typo can't lock us out.
@@ -3363,6 +3381,7 @@ async def api_server_ping(request: Request, server_id: int):
 
 
 @app.post('/api/servers/reorder', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_reorder_servers(request: Request, req: ReorderServersRequest):
     """Persist a user-defined ordering of servers. Also remaps `server_id`
     references in user_connections so existing assignments survive the move.
@@ -3396,6 +3415,7 @@ async def api_reorder_servers(request: Request, req: ReorderServersRequest):
 
 
 @app.post('/api/servers/{server_id}/delete', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_delete_server(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3457,6 +3477,7 @@ def api_reboot_server(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/clear', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_clear_server(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -4679,6 +4700,7 @@ def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequ
 
 
 @app.post('/api/servers/{server_id}/uninstall', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_uninstall_protocol(request: Request, server_id: int, req: ProtocolRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -4922,6 +4944,7 @@ async def api_protocol_backup_upload(
 
 
 @app.post('/api/servers/{server_id}/backups/restore', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_protocol_backup_restore(request: Request, server_id: int, req: BackupDownloadRequest):
     """Restore a protocol from a backup archive on the remote server."""
     if not _check_admin(request):
@@ -5336,6 +5359,7 @@ def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest
 
 
 @app.post('/api/servers/{server_id}/server_config/save', tags=["Protocols"])
+@serialize_peer_lifecycle
 def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
     """Save the raw server-side WireGuard/Xray configuration and apply changes."""
     if not _check_admin(request):
@@ -5522,6 +5546,7 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
 
 
 @app.post('/api/servers/{server_id}/connections/remove', tags=["Connections"])
+@serialize_peer_lifecycle
 def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -5855,6 +5880,7 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
 
 
 @app.post('/api/users/add', tags=["Users"])
+@serialize_peer_lifecycle
 def api_add_user(request: Request, req: AddUserRequest):
     cur = get_current_user(request)
     if not cur or cur['role'] != 'admin':
@@ -6011,6 +6037,7 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
 
 
 @app.post('/api/users/{user_id}/delete', tags=["Users"])
+@serialize_peer_lifecycle
 async def api_delete_user(request: Request, user_id: str):
     cur = get_current_user(request)
     if not cur or cur['role'] != 'admin':
@@ -6080,6 +6107,18 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
+        if not req.client_id and protocol_base(req.protocol) in ('awg', 'awg2', 'awg3', 'awg_legacy'):
+            result = await peer_creates.create(user_id, req.server_id, req.protocol,
+                                               req.name, req.operation_id)
+            data = load_data()
+            operation = peer_creates.journal.read()[result['operation_id']]
+            server = next(server for server in data['servers']
+                          if server.get('uid') == operation['identity'][1])
+            response = {'status': 'success', 'operation_id': result['operation_id']}
+            if result.get('config'):
+                response['config'] = result['config']
+                response.update(config_payloads(result['config'], server, req.protocol))
+            return response
         data = load_data()
         user = next((u for u in data['users'] if u['id'] == user_id), None)
         if not user:
@@ -6155,6 +6194,9 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             resp['config'] = result['config']
             resp.update(config_payloads(result['config'], server, req.protocol))
         return resp
+    except PeerCreateError as error:
+        return JSONResponse({'error': str(error), 'operation_id': error.operation_id},
+                            status_code=error.status_code)
     except Exception as e:
         logger.exception("Error adding user connection")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -7038,6 +7080,7 @@ def api_backup_download(request: Request):
 
 
 @app.post('/api/settings/backup/restore', tags=["Settings"])
+@serialize_peer_lifecycle
 async def api_backup_restore(request: Request, file: UploadFile = File(...)):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
