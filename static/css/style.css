@@ -2260,6 +2260,12 @@ a:hover {
     font-variant-numeric: tabular-nums;
 }
 
+.client-endpoint {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
 .traffic-down,
 .traffic-up {
     min-width: 96px;

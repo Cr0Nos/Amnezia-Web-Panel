@@ -144,6 +144,7 @@
   "qr_format_amnezia_hint": "Animated series for AmneziaVPN, carries the server name. Hold the camera until every frame is read —",
   "qr_format_wireguard_hint": "The config or link as it is, for AmneziaWG, wg-quick and other clients. The server name is not passed on.",
   "no_data": "No data",
+  "peer_endpoint": "Public endpoint",
   "start_btn": "▶ Start",
   "stop_btn": "⏹ Stop",
   "config_btn": "⚙️ Config",
