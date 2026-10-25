@@ -3497,9 +3497,29 @@ PersistentKeepalive = 25
         self._invalidate_config_cache(protocol_type)
 
         # Sync config
-        self.ssh.run_sudo_command(
+        _, rm_err, rm_code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
         )
+        if rm_code != 0:
+            raise RuntimeError(
+                f"syncconf failed for {container_name} (exit {rm_code}): "
+                f"{rm_err or 'no output'}. The clients table was NOT updated.")
+
+        # Read back directly from the container (no cache) and require the
+        # peer to be gone before dropping it from the clients table.
+        self._invalidate_config_cache(protocol_type)
+        applied_config, _, vcode = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {config_path}")
+        if vcode != 0 or not (applied_config or '').strip():
+            raise RuntimeError(
+                f"Could not read back {container_name} config after removal "
+                f"— NOT dropping the peer from the clients table "
+                f"(verification impossible).")
+        if client_id in applied_config:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still present in {container_name} "
+                f"config after removal — NOT dropping it from the clients table "
+                f"(removal did not land).")
 
         # Update clients table
         clients_table = self._get_clients_table(protocol_type)

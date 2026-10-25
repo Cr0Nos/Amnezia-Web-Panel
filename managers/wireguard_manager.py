@@ -1066,7 +1066,12 @@ AllowedIPs = {client_ip}/32
 
         applied_config, _, vcode = self.ssh.run_sudo_command(
             f"docker exec -i {self.CONTAINER_NAME} cat {self.CONFIG_PATH}")
-        if vcode == 0 and client_id in (applied_config or ''):
+        if vcode != 0 or not (applied_config or '').strip():
+            raise RuntimeError(
+                f"Could not read back {self.CONTAINER_NAME} config after "
+                f"removal — NOT dropping it from the clients table "
+                f"(verification impossible).")
+        if client_id in applied_config:
             raise RuntimeError(
                 f"Peer {client_id[:12]}... is still present in "
                 f"{self.CONTAINER_NAME} config after removal — NOT dropping "

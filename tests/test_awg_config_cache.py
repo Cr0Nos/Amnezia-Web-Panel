@@ -206,5 +206,40 @@ class ServerConfigCacheTests(unittest.TestCase):
         self.assertEqual(self.ssh.files[CLIENTS_TABLE], table_before)
 
 
+
+    def test_failed_syncconf_aborts_remove(self):
+        """syncconf exiting non-zero must leave the clients table alone."""
+        self.ssh.files[CLIENTS_TABLE] = self._table_with_peer_b(enabled=True)
+        table_before = self.ssh.files[CLIENTS_TABLE]
+        real = self.ssh.run_sudo_command
+
+        def flaky(command, timeout=60):
+            if 'syncconf' in command:
+                return '', 'boom', 1
+            return real(command, timeout)
+
+        self.ssh.run_sudo_command = flaky
+        with self.assertRaises(RuntimeError):
+            self.manager.remove_client('awg', 'PEER_B')
+        self.assertEqual(self.ssh.files[CLIENTS_TABLE], table_before)
+
+    def test_silent_config_copy_failure_aborts_remove(self):
+        """docker cp reports success but the peer stays in the container
+        config: the table must NOT drop it (removal did not land)."""
+        self.ssh.files[CLIENTS_TABLE] = self._table_with_peer_b(enabled=True)
+        table_before = self.ssh.files[CLIENTS_TABLE]
+        real = self.ssh.run_sudo_command
+
+        def flaky(command, timeout=60):
+            if re.search(r"docker cp (\S+) \S+?:(\S+)", command):
+                return '', '', 0  # pretend success, do NOT copy
+            return real(command, timeout)
+
+        self.ssh.run_sudo_command = flaky
+        with self.assertRaises(RuntimeError):
+            self.manager.remove_client('awg', 'PEER_B')
+        self.assertEqual(self.ssh.files[CLIENTS_TABLE], table_before)
+        self.assertIn('PEER_B', self.ssh.files[CONFIG_PATH])
+
 if __name__ == '__main__':
     unittest.main()

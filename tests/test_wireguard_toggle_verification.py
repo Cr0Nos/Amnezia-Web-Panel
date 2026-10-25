@@ -56,6 +56,7 @@ class FakeSSH:
         self.uploads = {}
         self.skip_copy = skip_copy
         self.fail_sync = fail_sync
+        self.fail_readback = False
         self.commands = []
 
     def upload_file(self, content, remote_path):
@@ -79,6 +80,8 @@ class FakeSSH:
 
         m = re.search(r'docker exec -i \S+ cat (\S+)', command)
         if m:
+            if self.fail_readback:
+                return '', 'read failed', 1
             if m.group(1) in self.files:
                 return self.files[m.group(1)], '', 0
             return '', 'No such file or directory', 1
@@ -121,6 +124,15 @@ class WireGuardToggleVerificationTests(unittest.TestCase):
 
         self.assertEqual(saved, [], 'clientsTable must not drop a peer still in the config')
         self.assertIn(PEER_B, ssh.files[CONFIG_PATH])
+
+    def test_remove_aborts_when_readback_fails(self):
+        manager, _ssh, saved = self.make_manager()
+        manager.ssh.fail_readback = True
+
+        with self.assertRaises(RuntimeError):
+            manager.remove_client(PEER_B)
+
+        self.assertEqual(saved, [], 'clientsTable must not change when removal is unverifiable')
 
 
 if __name__ == '__main__':
