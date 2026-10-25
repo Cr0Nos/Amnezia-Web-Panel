@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import app as panel
-from peer_create import PeerCreateService
+from peer_create import PeerCreateService, access_signature
 from managers.awg_manager import AWGManager, generate_wg_keypair
 
 
@@ -238,6 +238,21 @@ class AdminCreateLifecycle(unittest.IsolatedAsyncioTestCase):
         await service.recover()
         self.assertEqual(list(self.remote.peers), [key])
         self.assertEqual(len(self.data['user_connections']), 1)
+
+    async def test_unrecoverable_head_entries_do_not_starve_later_operations(self):
+        for index in range(5):
+            private, public = generate_wg_keypair()
+            op_id = str(uuid.uuid4())
+            self.service.journal.put(dict(id=op_id,
+                identity=['u' if index == 4 else 'deleted-user-' + str(index),
+                          'node', 'awg3', 'device-' + str(index)],
+                private=private, public=public, access=access_signature(self.data['users'][0]),
+                phase='intent', endpoint=['192.0.2.1', 22, None]))
+        await self.service.recover(limit=4)
+        self.assertEqual(self.remote.peers, {})
+        await self.service.recover(limit=4)
+        self.assertEqual(len(self.data['user_connections']), 1)
+        self.assertEqual(len(self.remote.peers), 1)
 
     async def test_operation_id_cannot_be_rebound(self):
         await self.create()

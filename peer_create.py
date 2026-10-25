@@ -92,6 +92,7 @@ class PeerCreateService:
         self.load_data, self.save_data, self.data_lock = load_data, save_data, data_lock
         self.get_ssh, self.get_manager, self.public_endpoint = get_ssh, get_manager, public_endpoint
         self.tasks = {}
+        self.recovery_offset = 0
 
     @serialize_peer_lifecycle
     async def create(self, user_id, server_id, protocol, name, operation_id=None):
@@ -145,8 +146,13 @@ class PeerCreateService:
     @serialize_peer_lifecycle
     async def recover(self, limit=4):
         pending = [op['id'] for op in self.journal.read().values()
-                   if op['phase'] not in ('complete', 'blocked')][:limit]
-        for op_id in pending:
+                   if op['phase'] not in ('complete', 'blocked')]
+        if not pending:
+            return
+        offset = self.recovery_offset % len(pending)
+        batch = (pending[offset:] + pending[:offset])[:limit]
+        self.recovery_offset = (offset + len(batch)) % len(pending)
+        for op_id in batch:
             try:
                 await self.resume(op_id)
             except PeerCreateError:
