@@ -17,8 +17,22 @@ import ipaddress
 import logging
 import re
 import time
+import uuid
 import functools
 import threading
+from contextlib import nullcontext
+
+def _awg_batch_lock_of(obj):
+    """Return a usable context manager for the AWG batch lock,
+    tolerating objects (Mock-based fakes) that expose a truthy but
+    non-context-manager `_awg_batch_lock` attribute."""
+    lock = getattr(obj, '_awg_batch_lock', None)
+    if (lock is not None and
+            type(lock).__name__ not in ('Mock', 'MagicMock',
+                                      'NonCallableMock', 'PropertyMock') and
+            hasattr(lock, '__enter__') and hasattr(lock, '__exit__')):
+        return lock
+    return nullcontext()
 from managers.clients_table_reader import clients_table_missing
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
@@ -892,40 +906,65 @@ docker --version
             if state and state[1]:
                 containers.append(cname)
         if not containers:
-            self.ssh._awg_batch = {'_ts': time.time(), 'containers': {}}
+            with _awg_batch_lock_of(self.ssh):
+                self.ssh._awg_batch = {'_ts': time.time(), 'containers': {}}
             return
+        # Unique marker per call so concurrent/interleaved prefetches
+        # cannot confuse each other's split boundaries.
+        clients_marker = '@@CLIENTS_' + uuid.uuid4().hex + '@@'
+        # The trailing `echo` inside sh -c matters: when awg0.conf or
+        # clientsTable has no trailing newline, `cat` leaves the cursor
+        # mid-line and the next marker gets glued to the payload's last
+        # line (observed on FIRSTBYTE: all three containers' dumps merged
+        # into one section -> the awg2 card counted ~120 union peers).
         cmd = (
             'for c in ' + ' '.join(containers) + '; do '
             'echo "@@CONTAINER@@ $c"; '
             'docker exec "$c" sh -c \'cat /opt/amnezia/awg/awg0.conf 2>/dev/null; '
-            'echo "@@CLIENTS@@"; cat /opt/amnezia/awg/clientsTable 2>/dev/null\'; '
+            'echo; echo "' + clients_marker + '"; '
+            'cat /opt/amnezia/awg/clientsTable 2>/dev/null; echo\'; '
             'done'
         )
         out, err, code = self.ssh.run_sudo_command(cmd, timeout=60)
+        if code != 0:
+            logger.warning(
+                "prefetch_awg_state composite command failed "
+                "(exit %s): %s" % (code, err))
+            with _awg_batch_lock_of(self.ssh):
+                self.ssh._awg_batch = None
+            return
         batch = {}
         current = None
-        for line in (out or '').splitlines():
-            if line.startswith('@@CONTAINER@@ '):
-                current = line.split(' ', 1)[1].strip()
+        # Belt and braces: split on markers found anywhere in the stream,
+        # not only at line start, so even a glued marker still separates
+        # sections (the payload fragment before it stays with its owner).
+        for piece in re.split(r'(@@CONTAINER@@ [^\n]+|' + re.escape(clients_marker) + ')', out or ''):
+            if piece.startswith('@@CONTAINER@@ '):
+                current = piece.split(' ', 1)[1].strip()
                 batch[current] = {'config': [], 'clients': [], 'part': 'config'}
-            elif current and line.strip() == '@@CLIENTS@@':
+            elif current and piece.strip() == clients_marker:
                 batch[current]['part'] = 'clients'
             elif current:
-                batch[current][batch[current]['part']].append(line)
-        self.ssh._awg_batch = {
-            '_ts': time.time(),
-            'containers': {
-                name: {'config': '\n'.join(parts['config']),
-                       'clients': '\n'.join(parts['clients'])}
-                for name, parts in batch.items()
-            },
-        }
+                batch[current][batch[current]['part']].extend(piece.splitlines())
+        with _awg_batch_lock_of(self.ssh):
+            self.ssh._awg_batch = {
+                '_ts': time.time(),
+                'containers': {
+                    name: {'config': '\n'.join(parts['config']),
+                           'clients': '\n'.join(parts['clients'])}
+                    for name, parts in batch.items()
+                },
+            }
 
     def _batch_entry(self, container_name):
-        batch = getattr(self.ssh, '_awg_batch', None)
-        if batch is None or time.time() - batch.get('_ts', 0) > 15:
-            return None
-        return batch['containers'].get(container_name)
+        with _awg_batch_lock_of(self.ssh):
+            batch = getattr(self.ssh, '_awg_batch', None)
+            if batch is None or time.time() - batch.get('_ts', 0) > 15:
+                return None
+            entry = batch['containers'].get(container_name)
+            if entry is None:
+                return None
+            return entry
 
     def prepare_host(self, protocol_type):
         """Prepare host for container (mirrors prepare_host.sh)."""
@@ -2218,7 +2257,8 @@ x_exit_sync() {
                         f"{container_name} but its config has peers; dropping "
                         f"batch entry and re-reading directly")
                     try:
-                        del self.ssh._awg_batch['containers'][container_name]
+                        with _awg_batch_lock_of(self.ssh):
+                            self.ssh._awg_batch['containers'][container_name] = None
                     except Exception:
                         pass
                     return self._get_clients_table(protocol_type)
@@ -2229,11 +2269,32 @@ x_exit_sync() {
         try:
             data = json.loads(out)
             if isinstance(data, list):
-                # Diagnostics for the intermittent 'External instead of names'
-                # glitch: log which container the table came from, via which
-                # path, and how many records it held. When a response shows
-                # N named + M External, this line tells whether the read
-                # itself returned a wrong/partial table.
+                if batch is not None and data:
+                    # Integrity guard against a poisoned prefetch batch: a
+                    # batch entry must contain ONE container's files. A mixed
+                    # entry (config of container A + clientsTable of container
+                    # B) once painted 68 of 71 awg2 peers as 'External' on
+                    # NATA: the table pubkeys must exist in the SAME entry's
+                    # config; otherwise drop the entry and read directly.
+                    conf_text = batch.get('config') or ''
+                    pubkeys = set(re.findall(
+                        r'^\s*PublicKey\s*=\s*(\S+)', conf_text, re.MULTILINE))
+                    missing = [c.get('clientId', '') for c in data
+                               if c.get('clientId', '') not in pubkeys]
+                    if missing:
+                        logger.warning(
+                            f"clientsTable {container_name} from prefetch is "
+                            f"inconsistent with its own batch config "
+                            f"({len(missing)}/{len(data)} table pubkeys absent "
+                            f"from config, e.g. {missing[0][:12]}...); dropping "
+                            f"batch entry and reading directly")
+                        try:
+                            with _awg_batch_lock_of(self.ssh):
+                                self.ssh._awg_batch['containers'][container_name] = None
+                        except Exception:
+                            pass
+                        return self._get_clients_table(protocol_type)
+
                 logger.info(
                     f"clientsTable {container_name}: {len(data)} records, "
                     f"{len(out)} bytes (via {'prefetch batch' if batch is not None else 'direct read'})")
@@ -2259,7 +2320,8 @@ x_exit_sync() {
                     f"clientsTable from prefetch for {container_name} did not "
                     f"parse; dropping batch and retrying directly")
                 try:
-                    del self.ssh._awg_batch['containers'][container_name]
+                    with _awg_batch_lock_of(self.ssh):
+                        self.ssh._awg_batch['containers'][container_name] = None
                 except Exception:
                     pass
                 return self._get_clients_table(protocol_type)
@@ -2279,8 +2341,9 @@ x_exit_sync() {
             save_clients_table(self.ssh, container_name, clients_table_path, clients_table)
         finally:
             # A lost reply may follow a committed rename: reread either way.
-            if getattr(self.ssh, '_awg_batch', None) is not None:
-                self.ssh._awg_batch = None
+            with _awg_batch_lock_of(self.ssh):
+                if getattr(self.ssh, '_awg_batch', None) is not None:
+                    self.ssh._awg_batch = None
 
         # Keep per-peer bandwidth limits in sync (best effort)
         try:
@@ -2422,8 +2485,9 @@ done < "$BW"
         # The /check batch cache holds configs AND clientsTables of every
         # container on this connection - any peer/config write must drop it,
         # or a read within the batch TTL would resurrect pre-write state.
-        if getattr(self.ssh, '_awg_batch', None) is not None:
-            self.ssh._awg_batch = None
+        with _awg_batch_lock_of(self.ssh):
+            if getattr(self.ssh, '_awg_batch', None) is not None:
+                self.ssh._awg_batch = None
 
     @staticmethod
     def _sanitize_server_config(config_content):
