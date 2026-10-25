@@ -26,6 +26,19 @@ class PublicEndpointPortCheckTests(unittest.TestCase):
         self.assertIn("onclick=\"checkPublicEndpointPort()\"", self.page)
         self.assertIn("/protocol/port-check?port=", self.page)
 
+    def test_docker_holder_flow_warns_but_keeps_save(self):
+        # When only docker-proxy/dockerd hold the port, Save stays enabled
+        # (publicEndpointPortVerified = true) but a warning from the API is
+        # rendered in the result area with warning styling.
+        self.assertIn('data.warning', self.page)
+        self.assertIn("res.style.color = 'var(--warning, #fbbf24)'", self.page)
+        # the docker-only branch keeps verification true (Save enabled) and
+        # the text surfaces the holder list
+        idx = self.page.index('!foreign.length')
+        docker_section = self.page[idx:idx + 300]
+        self.assertIn('publicEndpointPortVerified = true', docker_section)
+        self.assertIn('warnText', docker_section)
+
     def test_save_is_gated_by_the_check(self):
         self.assertIn('publicEndpointPortVerified', self.page)
         self.assertIn("btn.disabled = !!port && port !== publicEndpointSavedPort && !publicEndpointPortVerified",

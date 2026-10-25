@@ -5278,7 +5278,21 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
                     ssh = await asyncio.to_thread(get_ssh, server)
                     await asyncio.to_thread(ssh.connect)
                 for cmd in fwd:
-                    await asyncio.to_thread(ssh.run_command, cmd)
+                    out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd)
+                    if code != 0 and not warning:
+                        logger.warning(f"Public port forward command failed on {proto}: {cmd}: {err}")
+                        warning = f"forward command failed: {cmd}: {err}"
+                # Verify the rule exists for each address family when adding.
+                if not warning and port and str(port) != str(listen_port):
+                    l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
+                    if l4:
+                        for ipt in ('iptables', 'ip6tables'):
+                            verify = (f'{ipt} -t nat -C PREROUTING -p {l4} --dport {port} '
+                                      f'-j REDIRECT --to-ports {listen_port}')
+                            vout, verr, vcode = await asyncio.to_thread(ssh.run_sudo_command, verify)
+                            if vcode != 0 and not warning:
+                                logger.warning(f"Public port forward verification failed on {proto}: {ipt}: {verr}")
+                                warning = f"forward verification failed: {ipt} REDIRECT to :{listen_port} not present"
         except Exception as e:
             logger.warning(f"Could not apply the public endpoint to {proto}: {e}")
             warning = str(e)
@@ -5334,9 +5348,15 @@ async def restore_public_port_forwards():
         try:
             ssh = get_ssh(server)
             await asyncio.to_thread(ssh.connect)
+            failed = False
             for cmd in commands:
-                await asyncio.to_thread(ssh.run_command, cmd)
-            logger.info(f"Public port forwards re-applied on {server.get('name') or server.get('host')}")
+                out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd)
+                if code != 0:
+                    logger.error(f"Failed to re-apply public port forward on "
+                                 f"{server.get('name') or server.get('host')}: {cmd}: {err}")
+                    failed = True
+            if not failed:
+                logger.info(f"Public port forwards re-applied on {server.get('name') or server.get('host')}")
         except Exception as e:
             logger.warning(f"Could not re-apply public port forwards on "
                            f"{server.get('name') or server.get('host')}: {e}")
@@ -5420,7 +5440,14 @@ async def api_check_protocol_port(request: Request, server_id: int, port: str = 
         out, _, _ = await asyncio.to_thread(
             ssh.run_command, "ss -tulpnH '( sport = :%d )'" % int(port))
         listeners = _parse_ss_listeners(out)
-        return {'port': int(port), 'in_use': bool(listeners), 'listeners': listeners}
+        resp = {'port': int(port), 'in_use': bool(listeners), 'listeners': listeners}
+        if listeners:
+            foreign = [l for l in listeners
+                       if not re.match(r'^(docker-proxy|dockerd)$', l.get('process', ''))]
+            if not foreign:
+                resp['warning'] = (f'Port {port} is held by Docker; the REDIRECT rule may '
+                                   f'conflict unless the container publish is removed.')
+        return resp
     except Exception as e:
         logger.warning(f"Port check on server {server_id} failed: {e}")
         return JSONResponse({'error': str(e)}, status_code=502)

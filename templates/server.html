@@ -2577,8 +2577,9 @@
                 const holders = data.listeners.map(describe).join('; ');
                 if (!foreign.length) {
                     publicEndpointPortVerified = true;
-                    res.style.color = 'var(--success, #16a34a)';
-                    res.textContent = '✓ ' + _('public_endpoint_port_docker') + ': ' + holders;
+                    res.style.color = 'var(--warning, #fbbf24)';
+                    const warnText = data.warning ? ' ' + data.warning : '';
+                    res.textContent = '✓ ' + _('public_endpoint_port_docker') + warnText + ': ' + holders;
                 } else {
                     publicEndpointPortVerified = false;
                     res.style.color = 'var(--error, #dc2626)';

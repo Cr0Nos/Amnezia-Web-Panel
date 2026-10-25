@@ -234,9 +234,15 @@ class PublicEndpointApiTests(unittest.TestCase):
     def set_endpoint(self, client, **body):
         return client.post('/api/servers/0/protocol/public-endpoint', json=body)
 
+    def working_ssh(self):
+        """A mock SSH whose sudo commands succeed (returns a 3-tuple)."""
+        ssh = mock.Mock()
+        ssh.run_sudo_command.return_value = ('', '', 0)
+        return ssh
+
     def test_set_and_clear_round_trip(self):
         client = self.client()
-        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()):
+        with mock.patch.object(panel, 'get_ssh', return_value=self.working_ssh()):
             res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                                     public_port='443')
         self.assertEqual(res.status_code, 200, res.text)
@@ -277,7 +283,7 @@ class PublicEndpointApiTests(unittest.TestCase):
     def test_telemt_override_is_pushed_into_the_running_config(self):
         client = self.client()
         manager = mock.Mock()
-        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+        with mock.patch.object(panel, 'get_ssh', return_value=self.working_ssh()), \
              mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
             res = self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9',
                                     public_port='443')
@@ -287,7 +293,7 @@ class PublicEndpointApiTests(unittest.TestCase):
     def test_telemt_falls_back_to_the_instance_port(self):
         client = self.client()
         manager = mock.Mock()
-        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+        with mock.patch.object(panel, 'get_ssh', return_value=self.working_ssh()), \
              mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
             self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9')
         manager.set_public_endpoint.assert_called_once_with('203.0.113.9', '8443')
@@ -304,7 +310,7 @@ class PublicEndpointApiTests(unittest.TestCase):
         client = self.client()
         manager = mock.Mock()
         manager.install_protocol.return_value = {'status': 'success', 'awg_params': {}}
-        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+        with mock.patch.object(panel, 'get_ssh', return_value=self.working_ssh()), \
              mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
             self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                               public_port='443')
@@ -322,7 +328,7 @@ class PublicEndpointApiTests(unittest.TestCase):
         client = self.client()
         manager = mock.Mock()
         manager.install_protocol.return_value = {'status': 'success'}
-        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+        with mock.patch.object(panel, 'get_ssh', return_value=self.working_ssh()), \
              mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
             self.set_endpoint(client, protocol='telemt', public_host='203.0.113.9',
                               public_port='443')
@@ -339,7 +345,7 @@ class PublicEndpointApiTests(unittest.TestCase):
         client = self.client()
         manager = mock.Mock()
         manager.add_client.return_value = {'client_id': 'peer', 'config': '[Interface]'}
-        with mock.patch.object(panel, 'get_ssh', return_value=mock.Mock()), \
+        with mock.patch.object(panel, 'get_ssh', return_value=self.working_ssh()), \
              mock.patch.object(panel, 'get_protocol_manager', return_value=manager):
             self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                               public_port='443')
@@ -419,6 +425,19 @@ class PortCheckApiTests(PublicEndpointApiTests):
         self.assertEqual(client.get('/api/servers/0/protocol/port-check').status_code, 400)
         self.assertEqual(client.get('/api/servers/7/protocol/port-check?port=443').status_code, 404)
 
+    def test_port_check_warns_when_docker_holds_the_port(self):
+        client = self.client()
+        ssh = self._ssh_returning(
+            'udp   UNCONN 0      0            0.0.0.0:8443       0.0.0.0:*    '
+            'users:(("docker-proxy",pid=1234,fd=4))\n')
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh):
+            res = client.get('/api/servers/0/protocol/port-check?port=8443')
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertTrue(body['in_use'])
+        self.assertIn('warning', body)
+        self.assertIn('Docker', body['warning'])
+
     def test_anonymous_and_unreachable_server(self):
         with TestClient(panel.app) as client:
             self.assertEqual(client.get('/api/servers/0/protocol/port-check?port=443').status_code, 403)
@@ -437,7 +456,7 @@ class PublicPortForwardTests(PublicEndpointApiTests):
     def ssh_recorder(self):
         ssh = mock.Mock()
         ssh.commands = []
-        ssh.run_command.side_effect = lambda cmd, *a, **k: ssh.commands.append(cmd) or ('', '', 0)
+        ssh.run_sudo_command.side_effect = lambda cmd, *a, **k: ssh.commands.append(cmd) or ('', '', 0)
         return ssh
 
     def test_command_builder_publishes_udp_for_wireguard_family(self):
@@ -470,10 +489,24 @@ class PublicPortForwardTests(PublicEndpointApiTests):
                                     public_port='8443')
         self.assertEqual(res.status_code, 200, res.text)
         self.assertEqual(res.json()['warning'], '')
-        self.assertEqual(len(ssh.commands), 2)
+        # 2 forward (add) + 2 verification (-C) commands, one per address family
+        self.assertEqual(len(ssh.commands), 4)
         for ipt in ('iptables', 'ip6tables'):
             self.assertTrue(any(c.startswith(f'{ipt} -t nat -C PREROUTING -p udp --dport 8443')
                                 and '--to-ports 55424' in c for c in ssh.commands), ssh.commands)
+
+    def test_iptables_failure_warns_but_keeps_setting(self):
+        client = self.client()
+        ssh = mock.Mock()
+        ssh.run_sudo_command.return_value = ('', 'Permission denied', 1)
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh):
+            res = self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
+                                    public_port='8443')
+        self.assertEqual(res.status_code, 200, res.text)
+        body = res.json()
+        self.assertIn('forward command failed', body['warning'])
+        self.assertIn('Permission denied', body['warning'])
+        self.assertEqual(self.stored('awg2')['public_port'], '8443')
 
     def test_clearing_the_port_removes_the_rules(self):
         client = self.client()
@@ -535,7 +568,7 @@ class RestoreForwardTests(unittest.TestCase):
         def fake_ssh(server):
             ssh = mock.Mock()
             ssh.commands = []
-            ssh.run_command.side_effect = lambda cmd, *a, **k: ssh.commands.append(cmd) or ('', '', 0)
+            ssh.run_sudo_command.side_effect = lambda cmd, *a, **k: ssh.commands.append(cmd) or ('', '', 0)
             seen.append((server, ssh))
             return ssh
 
@@ -551,6 +584,27 @@ class RestoreForwardTests(unittest.TestCase):
         self.assertTrue(any('-p udp' in c and '--dport 8443' in c for c in ssh.commands), ssh.commands)
         self.assertTrue(any('-p tcp' in c and '--dport 8443' in c for c in ssh.commands), ssh.commands)
         self.assertFalse(any('--dport 51820' in c for c in ssh.commands))
+
+    def test_restore_forward_logs_failed_command(self):
+        panel.RESTORE_FORWARD_DELAY = 0
+
+        def fake_ssh(server):
+            ssh = mock.Mock()
+            ssh.commands = []
+
+            def run(cmd, *a, **k):
+                ssh.commands.append(cmd)
+                if len(ssh.commands) == 2:
+                    return ('', 'Permission denied', 1)
+                return ('', '', 0)
+            ssh.run_sudo_command.side_effect = run
+            return ssh
+
+        with mock.patch.object(panel, 'get_ssh', side_effect=fake_ssh), \
+             mock.patch.object(panel.logger, 'error') as log_err:
+            asyncio.run(panel.restore_public_port_forwards())
+        self.assertTrue(log_err.called)
+        self.assertIn('Permission denied', log_err.call_args[0][0])
 
     def test_a_down_server_does_not_stop_the_rest(self):
         def fake_ssh(server):
