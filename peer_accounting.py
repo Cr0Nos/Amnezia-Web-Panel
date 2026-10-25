@@ -4,6 +4,7 @@ Neither enabled=False nor a successful SSH scrape proves that a peer can no
 longer transfer traffic. Keep its owner and baselines even for unlimited users.
 """
 from peer_lifecycle_lock import serialize_peer_lifecycle
+import functools
 
 
 FINALIZATION_MESSAGE = (
@@ -36,3 +37,15 @@ def require_unowned(data, *, server_id=None, protocol=None, client_id=None,
         if user_ids is not None and conn.get('user_id') not in user_ids:
             continue
         raise TrafficFinalizationRequired()
+
+
+def guard_user_deletions(load_data):
+    """Preflight a whole mixed batch before its toggle/create phases run."""
+    def decorate(function):
+        @functools.wraps(function)
+        async def guarded(delete_uids=None, toggle_uids=None, create_conns=None):
+            if delete_uids:
+                require_unowned(load_data(), user_ids=set(delete_uids))
+            return await function(delete_uids, toggle_uids, create_conns)
+        return guarded
+    return decorate

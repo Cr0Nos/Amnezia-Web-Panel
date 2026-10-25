@@ -259,6 +259,7 @@ load_translations()
 
 # Global lock for data.json access to prevent race conditions during async operations
 from peer_lifecycle_lock import serialize_peer_lifecycle
+from peer_accounting import guard_user_deletions
 
 DATA_LOCK = asyncio.Lock()
 
@@ -1851,17 +1852,13 @@ async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
 
 
 @serialize_peer_lifecycle
+@guard_user_deletions(lambda: load_data())
 async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: List[tuple] = None, create_conns: List[dict] = None):
     """
     Executes multiple SSH operations efficiently.
     Reloads data inside to ensure we don't overwrite other changes.
     """
     data = load_data()
-    # Reject the entire batch before any external side effect, not after a
-    # per-server exception has been swallowed and user cleanup has run.
-    if delete_uids:
-        from peer_accounting import require_unowned
-        require_unowned(data, user_ids=set(delete_uids))
     server_ops = {}
 
     def get_ops(sid):
@@ -1955,6 +1952,7 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
     async with DATA_LOCK:
         current_data = load_data()
         if delete_uids:
+            from peer_accounting import require_unowned
             require_unowned(current_data, user_ids=set(delete_uids))
             current_data['users'] = [u for u in current_data['users'] if u['id'] not in delete_uids]
             current_data['user_connections'] = [c for c in current_data.get('user_connections', []) if c['user_id'] not in delete_uids]
