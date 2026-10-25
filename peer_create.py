@@ -7,6 +7,7 @@ Only a single panel process may drive this journal (as with DATA_LOCK).
 import asyncio
 import copy
 import json
+import logging
 import os
 import tempfile
 import threading
@@ -15,6 +16,8 @@ from datetime import datetime
 
 from managers.awg_manager import generate_wg_keypair
 from peer_lifecycle_lock import serialize_peer_lifecycle
+
+logger = logging.getLogger(__name__)
 
 
 class PeerCreateError(RuntimeError):
@@ -93,6 +96,20 @@ class PeerCreateService:
         self.get_ssh, self.get_manager, self.public_endpoint = get_ssh, get_manager, public_endpoint
         self.tasks = {}
         self.recovery_offset = 0
+        self.recovery_task = None
+
+    def schedule_recovery(self):
+        """Use the existing tick without blocking traffic/policy reconciliation."""
+        if self.recovery_task is None or self.recovery_task.done():
+            async def background():
+                try:
+                    await self.recover()
+                except Exception:
+                    # Journal/parser/SSH diagnostics must not expose key data
+                    # or abort the unrelated accounting/background cycle.
+                    logger.warning('Peer creation recovery incomplete; journal retained')
+            self.recovery_task = asyncio.create_task(background())
+        return self.recovery_task
 
     @serialize_peer_lifecycle
     async def create(self, user_id, server_id, protocol, name, operation_id=None):

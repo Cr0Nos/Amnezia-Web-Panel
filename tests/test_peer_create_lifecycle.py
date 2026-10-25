@@ -254,6 +254,26 @@ class AdminCreateLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.data['user_connections']), 1)
         self.assertEqual(len(self.remote.peers), 1)
 
+    async def test_background_recovery_does_not_block_tick_or_duplicate_tasks(self):
+        entered, release = asyncio.Event(), asyncio.Event()
+        async def slow_recovery():
+            entered.set()
+            await release.wait()
+        with patch.object(self.service, 'recover', side_effect=slow_recovery):
+            task = self.service.schedule_recovery()
+            await entered.wait()
+            self.assertIs(self.service.schedule_recovery(), task)
+            self.assertFalse(task.done())
+            release.set()
+            await task
+
+    async def test_bad_journal_does_not_abort_unrelated_background_work(self):
+        self.path.write_text('not-json', encoding='utf-8')
+        with self.assertLogs('peer_create', level='WARNING') as logs:
+            await self.service.schedule_recovery()
+        self.assertIn('journal retained', logs.output[0])
+        self.assertEqual(self.remote.peers, {})
+
     async def test_operation_id_cannot_be_rebound(self):
         await self.create()
         result = await self.create(name='foreign-intent')

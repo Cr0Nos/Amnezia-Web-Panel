@@ -2876,7 +2876,7 @@ async def periodic_background_tasks():
     """Background task to sync traffic limits and Remnawave every 10 minutes"""
     while True:
         try:
-            await peer_creates.recover()
+            peer_creates.schedule_recovery()
             # We wait before the first sync to let the app settle
             await asyncio.sleep(60) 
             
