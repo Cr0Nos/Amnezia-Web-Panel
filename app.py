@@ -5570,13 +5570,8 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'remove_client', req.protocol, req.client_id)
         ssh.disconnect()
-        # Remove from user_connections
-        data['user_connections'] = [
-            c for c in data.get('user_connections', [])
-            if not (c.get('client_id') == req.client_id and c.get('server_id') == server_id
-                    and c.get('protocol') == req.protocol)
-        ]
-        save_data(data)
+        # The preflight proved this peer has no local owner. Do not save
+        # the pre-SSH JSON: unrelated traffic/access commits can occur meanwhile.
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error removing connection")

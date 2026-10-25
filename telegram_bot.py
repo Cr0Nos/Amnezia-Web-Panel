@@ -1285,11 +1285,9 @@ async def _admin_remove_client(api: TelegramAPI, chat_id: int, message_id: int, 
             _manager_call(manager, "remove_client", proto, client_id)
         finally:
             ssh.disconnect()
-        data["user_connections"] = [
-            c for c in data.get("user_connections", [])
-            if not (c.get("server_id") == server_id and c.get("protocol") == proto and c.get("client_id") == client_id)
-        ]
-        save_data_fn(data)
+        # Unlinked removal has no local mutation; never overwrite concurrent
+        # accounting/access commits with the earlier snapshot.
+
 
     try:
         await asyncio.to_thread(_remove)

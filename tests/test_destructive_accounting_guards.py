@@ -107,7 +107,8 @@ class DestructiveAccountingGuards(unittest.IsolatedAsyncioTestCase):
                 panel.ConnectionActionRequest(protocol='awg3', client_id='unowned'))
         self.assertEqual(result, {'status': 'success'})
         self.assertEqual(call.call_args.args[1:], ('remove_client', 'awg3', 'unowned'))
-        self.assertEqual(self.save.call_args.args[0]['user_connections'], self.data['user_connections'])
+        self.save.assert_not_called()
+        self.assertEqual(self.data['user_connections'], state()['user_connections'])
 
     async def test_same_client_key_in_other_protocol_keeps_ownership(self):
         ssh = Mock()
@@ -117,7 +118,8 @@ class DestructiveAccountingGuards(unittest.IsolatedAsyncioTestCase):
             result = await panel.api_remove_connection(self.request, 0,
                 panel.ConnectionActionRequest(protocol='awg2', client_id='peer'))
         self.assertEqual(result, {'status': 'success'})
-        self.assertEqual(self.save.call_args.args[0]['user_connections'], self.data['user_connections'])
+        self.save.assert_not_called()
+        self.assertEqual(self.data['user_connections'], state()['user_connections'])
 
     async def test_empty_user_still_deletes(self):
         self.data['users'].append({'id': 'empty'})
