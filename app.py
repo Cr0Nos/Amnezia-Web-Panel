@@ -258,6 +258,8 @@ load_translations()
 # ======================== Helpers ========================
 
 # Global lock for data.json access to prevent race conditions during async operations
+from peer_lifecycle_lock import serialize_peer_lifecycle
+
 DATA_LOCK = asyncio.Lock()
 
 
@@ -1801,25 +1803,21 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def _traffic_removal_guard(data, **scope):
+    from peer_accounting import TrafficFinalizationRequired, require_unowned
+    try:
+        require_unowned(data, **scope)
+    except TrafficFinalizationRequired as error:
+        return JSONResponse({'error': str(error), 'code': error.code}, status_code=409)
+    return None
+
+
 def perform_delete_user(data: dict, user_id: str):
     user = next((u for u in data['users'] if u['id'] == user_id), None)
     if not user:
         return False
-    # Remove user's connections from servers
-    user_conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
-    for uc in user_conns:
-        try:
-            sid = uc['server_id']
-            if sid < len(data['servers']):
-                server = data['servers'][sid]
-                ssh = get_ssh(server)
-                ssh.connect()
-                manager = get_protocol_manager(ssh, uc['protocol'])
-                _manager_call(manager, 'remove_client', uc['protocol'], uc['client_id'])
-                ssh.disconnect()
-        except Exception as e:
-            logger.warning(f"Failed to remove connection {uc['client_id']} during user delete: {e}")
-    data['user_connections'] = [c for c in data.get('user_connections', []) if c['user_id'] != user_id]
+    from peer_accounting import require_unowned
+    require_unowned(data, user_ids={user_id})
     data['users'] = [u for u in data['users'] if u['id'] != user_id]
     return True
 
@@ -1852,12 +1850,18 @@ async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
     return True
 
 
+@serialize_peer_lifecycle
 async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: List[tuple] = None, create_conns: List[dict] = None):
     """
     Executes multiple SSH operations efficiently.
     Reloads data inside to ensure we don't overwrite other changes.
     """
     data = load_data()
+    # Reject the entire batch before any external side effect, not after a
+    # per-server exception has been swallowed and user cleanup has run.
+    if delete_uids:
+        from peer_accounting import require_unowned
+        require_unowned(data, user_ids=set(delete_uids))
     server_ops = {}
 
     def get_ops(sid):
@@ -1951,6 +1955,7 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
     async with DATA_LOCK:
         current_data = load_data()
         if delete_uids:
+            require_unowned(current_data, user_ids=set(delete_uids))
             current_data['users'] = [u for u in current_data['users'] if u['id'] not in delete_uids]
             current_data['user_connections'] = [c for c in current_data.get('user_connections', []) if c['user_id'] not in delete_uids]
         if toggle_uids:
@@ -3226,6 +3231,7 @@ async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustC
 
 
 @app.post('/api/servers/add', tags=["Servers"])
+@serialize_peer_lifecycle
 def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3263,6 +3269,7 @@ def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
     """Update connection details for an existing server entry. Verifies the new
     credentials by SSH-connecting before persisting, so a typo can't lock us out.
@@ -3363,6 +3370,7 @@ async def api_server_ping(request: Request, server_id: int):
 
 
 @app.post('/api/servers/reorder', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_reorder_servers(request: Request, req: ReorderServersRequest):
     """Persist a user-defined ordering of servers. Also remaps `server_id`
     references in user_connections so existing assignments survive the move.
@@ -3396,13 +3404,17 @@ async def api_reorder_servers(request: Request, req: ReorderServersRequest):
 
 
 @app.post('/api/servers/{server_id}/delete', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_delete_server(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         # Exit-node links: restore direct egress on entries routed through
         # this server, and drop this server's own peers on the exits it used.
@@ -3414,8 +3426,11 @@ async def api_delete_server(request: Request, server_id: int):
             logger.warning(f"exit-link cleanup before delete failed: {e}")
         async with DATA_LOCK:
             data = load_data()
-            if server_id >= len(data['servers']):
+            if server_id < 0 or server_id >= len(data['servers']):
                 return JSONResponse({'error': 'Server not found'}, status_code=404)
+            guard = _traffic_removal_guard(data, server_id=server_id)
+            if guard is not None:
+                return guard
             server = data['servers'][server_id]
             await _finish_locked_worker(lambda: drop_ssh(server))
             data['servers'].pop(server_id)
@@ -3457,13 +3472,17 @@ def api_reboot_server(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/clear', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_clear_server(request: Request, server_id: int):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         try:
             if (server.get('protocols') or {}).get('exit'):
@@ -4679,13 +4698,17 @@ def api_awg_settings_save(request: Request, server_id: int, req: AwgSettingsRequ
 
 
 @app.post('/api/servers/{server_id}/uninstall', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_uninstall_protocol(request: Request, server_id: int, req: ProtocolRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         base = protocol_base(req.protocol)
         if base in AWG_PROTOCOLS and ((server.get('protocols') or {}).get(req.protocol) or {}).get('exit_link'):
@@ -4922,6 +4945,7 @@ async def api_protocol_backup_upload(
 
 
 @app.post('/api/servers/{server_id}/backups/restore', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_protocol_backup_restore(request: Request, server_id: int, req: BackupDownloadRequest):
     """Restore a protocol from a backup archive on the remote server."""
     if not _check_admin(request):
@@ -4936,6 +4960,9 @@ async def api_protocol_backup_restore(request: Request, server_id: int, req: Bac
         data = load_data()
         if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         container = protocol_container_name(req.protocol)
         if not container:
@@ -5336,14 +5363,18 @@ def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest
 
 
 @app.post('/api/servers/{server_id}/server_config/save', tags=["Protocols"])
+@serialize_peer_lifecycle
 def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
     """Save the raw server-side WireGuard/Xray configuration and apply changes."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
@@ -5522,13 +5553,17 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
 
 
 @app.post('/api/servers/{server_id}/connections/remove', tags=["Connections"])
+@serialize_peer_lifecycle
 def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol, client_id=req.client_id)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
@@ -5540,7 +5575,8 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
         # Remove from user_connections
         data['user_connections'] = [
             c for c in data.get('user_connections', [])
-            if not (c.get('client_id') == req.client_id and c.get('server_id') == server_id)
+            if not (c.get('client_id') == req.client_id and c.get('server_id') == server_id
+                    and c.get('protocol') == req.protocol)
         ]
         save_data(data)
         return {'status': 'success'}
@@ -5855,6 +5891,7 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
 
 
 @app.post('/api/users/add', tags=["Users"])
+@serialize_peer_lifecycle
 def api_add_user(request: Request, req: AddUserRequest):
     cur = get_current_user(request)
     if not cur or cur['role'] != 'admin':
@@ -6011,6 +6048,7 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
 
 
 @app.post('/api/users/{user_id}/delete', tags=["Users"])
+@serialize_peer_lifecycle
 async def api_delete_user(request: Request, user_id: str):
     cur = get_current_user(request)
     if not cur or cur['role'] != 'admin':
@@ -6019,11 +6057,17 @@ async def api_delete_user(request: Request, user_id: str):
     if cur['id'] == user_id:
         return JSONResponse({'error': _t('cannot_delete_self', lang)}, status_code=400)
     try:
-        data = load_data()
-        success = await asyncio.to_thread(perform_delete_user, data, user_id)
-        if not success:
-            return JSONResponse({'error': 'User not found'}, status_code=404)
-        save_data(data)
+        # A linked user is rejected without SSH; deleting an empty user is a
+        # short local mutation. Resolve it under the lock so concurrent linking
+        # cannot disappear through the previous stale snapshot save.
+        async with DATA_LOCK:
+            data = load_data()
+            guard = _traffic_removal_guard(data, user_ids={user_id})
+            if guard is not None:
+                return guard
+            if not perform_delete_user(data, user_id):
+                return JSONResponse({'error': 'User not found'}, status_code=404)
+            save_data(data)
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error deleting user")
@@ -6076,6 +6120,7 @@ def api_reset_user_traffic(request: Request, user_id: str):
 
 
 @app.post('/api/users/{user_id}/connections/add', tags=["Users"])
+@serialize_peer_lifecycle
 async def api_add_user_connection(request: Request, user_id: str, req: AddUserConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6906,6 +6951,9 @@ async def api_sync_delete(request: Request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     to_delete_ids = [u['id'] for u in data['users'] if u.get('remnawave_uuid')]
+    guard = _traffic_removal_guard(data, user_ids=set(to_delete_ids))
+    if guard is not None:
+        return guard
     if to_delete_ids:
         await perform_mass_operations(delete_uids=to_delete_ids)
     return {'status': 'success', 'count': len(to_delete_ids)}
@@ -7038,6 +7086,7 @@ def api_backup_download(request: Request):
 
 
 @app.post('/api/settings/backup/restore', tags=["Settings"])
+@serialize_peer_lifecycle
 async def api_backup_restore(request: Request, file: UploadFile = File(...)):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -7072,6 +7121,10 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         # so the file on disk is complete without waiting for the next restart.
         backfill_server_uids(backup_data['servers'])
         async with DATA_LOCK:
+            # Even identical-looking old backups can rewind traffic baselines.
+            guard = _traffic_removal_guard(load_data())
+            if guard is not None:
+                return guard
             save_data(backup_data)
         
         # In a real app we might want to restart or re-init background tasks
