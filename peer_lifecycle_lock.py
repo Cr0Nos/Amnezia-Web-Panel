@@ -51,4 +51,3 @@ def serialize_peer_lifecycle(function):
                 task.cancel()
             raise
     return wrapped
-
