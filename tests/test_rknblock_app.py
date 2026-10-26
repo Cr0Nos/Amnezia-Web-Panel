@@ -178,9 +178,9 @@ class UpdateTests(SshCase):
 
 
 class ScansResponseTests(unittest.TestCase):
-    """api_rkn_scans must expose installed/enabled alongside the parsed stats."""
+    """api_rkn_scans exposes installed/enabled plus live running/healthy flags."""
 
-    def test_isolated_scans_endpoint_shape(self):
+    def _run(self, parsed, record):
         path = Path(__file__).resolve().parents[1] / 'app.py'
         tree = ast.parse(path.read_text(encoding='utf-8'))
         nodes = [n for n in tree.body
@@ -190,7 +190,7 @@ class ScansResponseTests(unittest.TestCase):
         namespace = {
             'Request': object, 'JSONResponse': JSONResponse, 'logger': Mock(),
             'load_data': Mock(), '_check_admin': Mock(return_value=True),
-            '_parse_rkn_scan_output': lambda out, flag: {'flag_enabled': flag},
+            '_parse_rkn_scan_output': lambda out, flag: dict(parsed),
             'asyncio': __import__('asyncio'),
         }
 
@@ -199,14 +199,43 @@ class ScansResponseTests(unittest.TestCase):
 
         namespace['_fetch_rkn_scan_output'] = fake_fetch
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
-        server = {'name': 'A', 'rknblock': {'installed': True, 'enabled': False}}
+        server = {'name': 'A', 'rknblock': record}
         namespace['load_data'] = Mock(return_value={'servers': [server]})
         request = SimpleNamespace(session={'user_id': 'admin'}, headers={})
-        result = namespace['asyncio'].run(
+        return namespace['asyncio'].run(
             namespace['api_rkn_scans'](request, 0))
+
+    def test_isolated_scans_endpoint_shape(self):
+        result = self._run(
+            {'flag_enabled': True, 'agent_state': 'unknown', 'sets_ok': False,
+             'health': None, 'problems': ['not_running', 'lists_empty'],
+             'sets': {'in4': 0, 'in6': 0, 'out4': 0, 'out6': 0}},
+            {'installed': True, 'enabled': False})
         self.assertTrue(result['installed'])
         self.assertFalse(result['enabled'])
         self.assertTrue(result['flag_enabled'])
+        self.assertFalse(result['running'])
+        self.assertFalse(result['healthy'])
+
+    def test_live_running_and_healthy_flags(self):
+        result = self._run(
+            {'flag_enabled': True, 'agent_state': 'on', 'sets_ok': True,
+             'health': 'ok', 'problems': [],
+             'sets': {'in4': 1151, 'in6': 21, 'out4': 204, 'out6': 3}},
+            {'installed': True, 'enabled': True})
+        self.assertTrue(result['running'])
+        self.assertTrue(result['healthy'])
+
+    def test_empty_sets_make_running_unhealthy(self):
+        result = self._run(
+            {'flag_enabled': True, 'agent_state': 'on', 'sets_ok': False,
+             'health': 'failed', 'problems': ['lists_empty', 'health_failed'],
+             'sets': {'in4': 0, 'in6': 0, 'out4': 0, 'out6': 0}},
+            {'installed': True, 'enabled': True})
+        self.assertTrue(result['running'])
+        self.assertFalse(result['healthy'])
+        self.assertIn('lists_empty', result['problems'])
+        self.assertIn('health_failed', result['problems'])
 
 
 if __name__ == '__main__':

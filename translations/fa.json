@@ -721,6 +721,7 @@
   "rkn_block_recent": "رویدادهای اخیر",
   "rkn_block_sets": "مجموعه‌ها",
   "rkn_block_sets_empty": "مجموعه‌ها خالی‌اند — update اجرا نشده",
+  "rkn_block_not_ready": "نصب شده اما فعال نیست — فهرست‌ها و قواعد iptables را بررسی کنید",
   "rkn_block_clear": "پاک‌کردن آمار اسکن",
   "rkn_block_clear_confirm": "رویدادهای اسکن روی سرور پاک شود؟",
   "rkn_block_cleared": "آمار اسکن پاک شد",

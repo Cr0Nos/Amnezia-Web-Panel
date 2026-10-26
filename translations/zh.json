@@ -721,6 +721,7 @@
   "rkn_block_recent": "最近事件",
   "rkn_block_sets": "集合",
   "rkn_block_sets_empty": "集合为空 — update 未运行",
+  "rkn_block_not_ready": "已安装但未激活——请检查列表和 iptables 规则",
   "rkn_block_clear": "清除扫描统计",
   "rkn_block_clear_confirm": "清除服务器上的扫描日志？",
   "rkn_block_cleared": "扫描统计已清除",

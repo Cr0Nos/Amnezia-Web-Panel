@@ -4068,6 +4068,12 @@ def _parse_rkn_scan_output(out, flag_enabled):
     m = re.search(r'last_update:\s*(\S+)', status_part)
     if m and m.group(1) != '—':
         last_update = m.group(1)
+    # Новый статус печатает health: ok|failed после проверки наборов и правил.
+    # Старые версии строку не печатают; тогда здоровье определяется по sets.
+    health = None
+    m = re.search(r'health:\s*(\w+)', status_part)
+    if m:
+        health = m.group(1).lower()
     events = []
     for line in (log_part or '').splitlines():
         line = line.strip()
@@ -4101,9 +4107,21 @@ def _parse_rkn_scan_output(out, flag_enabled):
         except ValueError:
             pass
 
+    sets_ok = sets.get('in4', 0) > 0 and sets.get('out4', 0) > 0
+    problems = []
+    if agent_state != 'on':
+        problems.append('not_running')
+    if not sets_ok:
+        problems.append('lists_empty')
+    if health == 'failed':
+        problems.append('health_failed')
+
     return {
         'flag_enabled': bool(flag_enabled),
         'agent_state': agent_state,
+        'health': health,
+        'sets_ok': sets_ok,
+        'problems': problems,
         'sets': sets,
         'flags': flags,
         'last_update': last_update,
@@ -4144,8 +4162,14 @@ async def api_rkn_scans(request: Request, server_id: int):
     record = server.get('rknblock') or {}
     installed = bool(record.get('installed'))
     parsed = _parse_rkn_scan_output(out, installed)
+    live_on = parsed.get('agent_state') == 'on'
     parsed['installed'] = installed
     parsed['enabled'] = bool(record.get('enabled', True)) if installed else False
+    parsed['running'] = bool(installed and live_on)
+    parsed['healthy'] = bool(installed and live_on
+                             and parsed.get('sets_ok')
+                             and parsed.get('health') != 'failed')
+    parsed['last_error'] = record.get('last_error')
     return parsed
 
 
@@ -4198,12 +4222,19 @@ async def api_rkn_scan_flags(request: Request):
             return idx, cached['data']
         try:
             out = await _fetch_rkn_scan_output(srv)
-            parsed = _parse_rkn_scan_output(out, srv.get('rkn_block_enabled', False))
+            installed = bool((srv.get('rknblock') or {}).get('installed'))
+            parsed = _parse_rkn_scan_output(out, installed)
+            live_on = parsed.get('agent_state') == 'on'
             summary = {'agent_state': parsed['agent_state'],
+                       'running': bool(installed and live_on),
+                       'healthy': bool(installed and live_on
+                                       and parsed.get('sets_ok')
+                                       and parsed.get('health') != 'failed'),
+                       'problems': parsed.get('problems', []),
                        'events24': parsed['last_24h'],
                        'last': parsed['last_event'],
-                       'flag': parsed['flag_enabled'],
-                       'installed': parsed['flag_enabled'],
+                       'flag': bool(installed),
+                       'installed': bool(installed),
                        'sets': parsed['sets']}
         except Exception:
             summary = None

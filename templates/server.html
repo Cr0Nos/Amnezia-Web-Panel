@@ -4967,18 +4967,23 @@
             return;
         }
         const agentAlive = d.agent_state !== 'unknown';
-        const running = agentAlive && d.enabled !== false;
+        const liveOn = d.running !== undefined ? d.running : (d.agent_state === 'on' && d.enabled !== false);
         const sets = d.sets || {};
         const inN = (sets.in4 || 0) + (sets.in6 || 0);
         const outN = (sets.out4 || 0) + (sets.out6 || 0);
         const setsEmpty = [sets.in4, sets.in6, sets.out4, sets.out6].every(v => !v);
+        const healthy = liveOn && d.healthy !== false && !setsEmpty;
 
         // Status badge + red scan-alert badge that opens the scans modal.
-        let badge = running
+        // Installed + running is not enough: zero lists or failed verification
+        // means the contour is doing nothing, so show a warning, not green.
+        let badge = healthy
             ? `<span class="badge badge-success"><span class="badge-dot"></span> ${_('rknblock_state_on')}</span>`
-            : (agentAlive
-                ? `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('rknblock_state_off')}</span>`
-                : `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('rknblock_state_unreachable')}</span>`);
+            : (liveOn
+                ? `<span class="badge badge-warn"><span class="badge-dot"></span> ${escapeHtml(setsEmpty ? _('rkn_block_sets_empty') : _('rkn_block_not_ready'))}</span>`
+                : (agentAlive
+                    ? `<span class="badge badge-warn"><span class="badge-dot"></span> ${_('rknblock_state_off')}</span>`
+                    : `<span class="badge badge-danger"><span class="badge-dot"></span> ${_('rknblock_state_unreachable')}</span>`));
         if (d.last_24h > 0) {
             badge += ` <button type="button"
                 style="background:var(--danger,#f85149); color:#fff; cursor:pointer; border:none;
@@ -4987,7 +4992,7 @@
                 title="${escapeHtml(_('rkn_block_recent'))}">⚠ ${escapeHtml(_('rkn_scan_alert'))} (${d.last_24h}) · ${escapeHtml(_('rkn_scans_more'))}</button>`;
         }
         statusEl.innerHTML = badge;
-        toggleBtn.textContent = running ? _('rknblock_stop') : _('rknblock_start');
+        toggleBtn.textContent = liveOn ? _('rknblock_stop') : _('rknblock_start');
 
         // Card keeps only the short summary; full details live in the modal.
         const flags = d.flags || {};
