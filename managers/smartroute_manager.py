@@ -233,7 +233,16 @@ iptables -t mangle -D PREROUTING -j $CHI 2>/dev/null || true
 iptables -t mangle -F $CHI 2>/dev/null || true
 iptables -t mangle -X $CHI 2>/dev/null || true
 if [ -n "$X_SUBNET" ] && command -v conntrack >/dev/null 2>&1; then conntrack -D -s "$X_SUBNET" >/dev/null 2>&1; fi
-echo "smartroute: split off, $(ip -4 route show table $TABLE | grep -c '^throw') throw routes left"
+# post-check: the caller treats a non-zero exit as "disable incomplete" -
+# on a clean container all counts are 0 (grep -c prints 0 even with exit 1)
+THROWS_LEFT=$(ip -4 route show table $TABLE | grep -c '^throw')
+CHAINS_LEFT=$(iptables -t mangle -S POSTROUTING | grep -c -- "-j $CH")
+CHAINS_LEFT=$((CHAINS_LEFT + $(iptables -t mangle -S PREROUTING | grep -c -- "-j $CHI")))
+if [ "$THROWS_LEFT" != 0 ] || [ "$CHAINS_LEFT" != 0 ]; then
+  echo "smartroute: disable incomplete (throws=$THROWS_LEFT chains=$CHAINS_LEFT)"
+  exit 1
+fi
+echo "smartroute: split off"
 """
 
 # NB: the parser reads the delegated file from argv[2], NOT stdin - `python3

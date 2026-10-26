@@ -385,6 +385,18 @@ class ApplyHardeningTests(unittest.TestCase):
         self.assertLess(CONTAINER_ENABLE_SCRIPT.index('[ "$APPLY_RC" = 0 ] || exit $APPLY_RC'),
                         CONTAINER_ENABLE_SCRIPT.index('iptables -t mangle -N $CH'))
 
+    def test_disable_script_post_checks_cleanup(self):
+        # leftover throw routes or still-attached accounting chains must make
+        # the disable exit non-zero so docker exec reports the failure
+        self.assertIn('disable incomplete', CONTAINER_DISABLE_SCRIPT)
+        self.assertIn('exit 1', CONTAINER_DISABLE_SCRIPT)
+        self.assertLess(CONTAINER_DISABLE_SCRIPT.index('disable incomplete'),
+                        CONTAINER_DISABLE_SCRIPT.index('exit 1'))
+
+    def test_disable_script_stays_within_throws_and_mangle(self):
+        for bad in ('FORWARD', 'OUTPUT', 'ipset', 'route flush table'):
+            self.assertNotIn(bad, CONTAINER_DISABLE_SCRIPT)
+
 
 if __name__ == '__main__':
     unittest.main()
