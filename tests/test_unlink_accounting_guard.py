@@ -21,7 +21,8 @@ class UnlinkAccountingGuard(unittest.IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory(prefix='panel-unlink-accounting-')
         self.addAsyncCleanup(self.cleanup)
         self.file = Path(self.temp.name) / 'data.json'
-        names = {'load_data', 'save_data', 'api_unlink_user_connection'}
+        names = {'load_data', 'save_data', 'api_unlink_user_connection',
+                 '_traffic_removal_guard'}
         nodes = [n for n in ast.parse(SOURCE.read_text(encoding='utf-8')).body
                  if getattr(n, 'name', '') in names]
         self.assertEqual({n.name for n in nodes}, names)
