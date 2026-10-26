@@ -263,10 +263,36 @@ load_translations()
 
 # Global lock for data.json access to prevent race conditions during async operations
 from peer_lifecycle_lock import serialize_peer_lifecycle
+import peer_lifecycle_lock
+from peer_accounting import guard_user_deletions
+from peer_recovery import (RecoveryStore, RecoveryError, PanelLease, STATE_FILE_LOCK,
+                           GENERATION, digest as recovery_digest, orphan_scope, validate_backup)
+from peer_recovery import verify_awg_peer_absent, check_create_journal, require_repair_target, DISASTER_HOLD
+
+peer_lifecycle_lock.configure(DATA_FILE)
+_panel_lease = None
 
 DATA_LOCK = asyncio.Lock()
 # Inventory/identity operations may await SSH; unrelated JSON updates stay free.
 SERVER_MUTATION_LOCK = asyncio.Lock()
+
+
+@app.on_event('shutdown')
+async def close_panel_lease():
+    if _panel_lease is not None:
+        _panel_lease.close()
+
+
+@app.exception_handler(peer_lifecycle_lock.PeerLifecycleBusy)
+async def lifecycle_busy_response(request, error):
+    return JSONResponse({'error': 'A lifecycle operation is still running. Retry later.',
+                         'code': str(error)}, status_code=503, headers={'Retry-After': '10'})
+
+
+@app.exception_handler(peer_lifecycle_lock.PeerLifecycleUncertain)
+async def lifecycle_uncertain_response(request, error):
+    return JSONResponse({'error': 'An SSH result is unknown. Administrator recovery is required.',
+                         'code': error.code}, status_code=503)
 
 
 def load_data():
@@ -330,21 +356,16 @@ def load_data():
 
 
 def save_data(data):
-    data_dir = os.path.dirname(DATA_FILE) or '.'
-    os.makedirs(data_dir, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix='.data-', suffix='.json', dir=data_dir)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp_path, DATA_FILE)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+    # Keep this writer self-contained for isolated handler/AST tests as well.
+    from peer_recovery import STATE_FILE_LOCK, GENERATION, RecoveryError, atomic_json
+    with STATE_FILE_LOCK:
+        if os.path.exists(DATA_FILE):
+            with open(DATA_FILE, 'r', encoding='utf-8') as source:
+                generation = json.load(source).get(GENERATION)
+            if generation and data.get(GENERATION) != generation:
+                raise RecoveryError('stale_snapshot_after_recovery')
+        os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
+        atomic_json(DATA_FILE, data)
 
 
 async def save_data_async(data):
@@ -1752,7 +1773,10 @@ def _self_service_error_response(exc):
     if isinstance(exc, RateLimitError):
         return JSONResponse({'error': str(exc)}, status_code=429)
     if isinstance(exc, SelfServiceError):
-        return JSONResponse({'error': str(exc)}, status_code=exc.status_code)
+        body = {'error': str(exc)}
+        if getattr(exc, 'code', None):
+            body['code'] = exc.code
+        return JSONResponse(body, status_code=exc.status_code)
     logger.exception("Unexpected self-service error")
     return JSONResponse({'error': 'Internal server error'}, status_code=500)
 
@@ -1831,25 +1855,21 @@ def verify_password(password: str, password_hash: str) -> bool:
         return False
 
 
+def _traffic_removal_guard(data, **scope):
+    from peer_accounting import TrafficFinalizationRequired, require_unowned
+    try:
+        require_unowned(data, **scope)
+    except TrafficFinalizationRequired as error:
+        return JSONResponse({'error': str(error), 'code': error.code}, status_code=409)
+    return None
+
+
 def perform_delete_user(data: dict, user_id: str):
     user = next((u for u in data['users'] if u['id'] == user_id), None)
     if not user:
         return False
-    # Remove user's connections from servers
-    user_conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
-    for uc in user_conns:
-        try:
-            sid = uc['server_id']
-            if sid < len(data['servers']):
-                server = data['servers'][sid]
-                ssh = get_ssh(server)
-                ssh.connect()
-                manager = get_protocol_manager(ssh, uc['protocol'])
-                _manager_call(manager, 'remove_client', uc['protocol'], uc['client_id'])
-                ssh.disconnect()
-        except Exception as e:
-            logger.warning(f"Failed to remove connection {uc['client_id']} during user delete: {e}")
-    data['user_connections'] = [c for c in data.get('user_connections', []) if c['user_id'] != user_id]
+    from peer_accounting import require_unowned
+    require_unowned(data, user_ids={user_id})
     data['users'] = [u for u in data['users'] if u['id'] != user_id]
     return True
 
@@ -1967,6 +1987,7 @@ async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
 
 
 @serialize_peer_lifecycle
+@guard_user_deletions(lambda: load_data())
 async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: List[tuple] = None, create_conns: List[dict] = None):
     """
     Executes multiple SSH operations efficiently.
@@ -2059,6 +2080,8 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
     async with DATA_LOCK:
         current_data = load_data()
         if delete_uids:
+            from peer_accounting import require_unowned
+            require_unowned(current_data, user_ids=set(delete_uids))
             current_data['users'] = [u for u in current_data['users'] if u['id'] not in delete_uids]
             current_data['user_connections'] = [c for c in current_data.get('user_connections', []) if c['user_id'] not in delete_uids]
         save_data(current_data)
@@ -2764,9 +2787,14 @@ def _start_conn_monitor():
 
 @app.on_event("startup")
 async def startup():
+    global _panel_lease
+    _panel_lease = PanelLease(DATA_FILE, runtime=True)
+    _panel_lease.acquire()
+    data = load_data()
+    if data.get(DISASTER_HOLD):
+        raise RuntimeError('Disaster recovery requires independent node reconciliation before startup')
     _start_conn_monitor()
     _start_duckdns_monitor()
-    data = load_data()
     changed = False
     if not data.get('users'):
         data['users'] = [{
@@ -3341,6 +3369,7 @@ async def _finish_server_operation(operation):
 
 
 @app.post('/api/servers/add', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -3385,6 +3414,7 @@ async def api_add_server(request: Request, req: AddServerRequest):
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_edit_server(request: Request, server_id: int, req: EditServerRequest,
                           server_uid: Optional[str] = None):
     if not _check_admin(request):
@@ -3524,13 +3554,18 @@ async def api_reorder_servers(request: Request, req: ReorderServersRequest):
 
 
 @app.post('/api/servers/{server_id}/delete', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_delete_server(request: Request, server_id: int, server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     selected, error = _server_identity(server_id, server_uid)
     if error is not None:
         return error
-    uid = selected['uid']
+        uid = selected['uid']
+    data = load_data()
+    guard = _traffic_removal_guard(data, server_id=server_id)
+    if guard is not None:
+        return guard
 
     async def delete():
         async with SERVER_MUTATION_LOCK:
@@ -3600,12 +3635,16 @@ def api_reboot_server(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/clear', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_clear_server(request: Request, server_id: int, server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     if not 0 <= server_id < len(data['servers']):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
+    guard = _traffic_removal_guard(data, server_id=server_id)
+    if guard is not None:
+        return guard
     selected = data['servers'][server_id]
     uid = selected.get('uid')
     if not uid or (server_uid is not None and server_uid != uid):
@@ -4332,6 +4371,7 @@ def api_used_ports(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/install', tags=["Protocols"])
+@serialize_peer_lifecycle
 async def api_install_protocol(request: Request, server_id: int, req: InstallProtocolRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -5028,8 +5068,11 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         base = protocol_base(req.protocol)
         if base in AWG_PROTOCOLS and ((server.get('protocols') or {}).get(req.protocol) or {}).get('exit_link'):
@@ -5281,6 +5324,9 @@ async def api_protocol_backup_restore(request: Request, server_id: int, req: Bac
         data = load_data()
         if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol, include_archived=True)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         container = protocol_container_name(req.protocol)
         if not container:
@@ -5950,8 +5996,11 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol, include_archived=True)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
@@ -6075,6 +6124,7 @@ def api_get_connections(request: Request, server_id: int, protocol: str = Query(
 
 
 @app.post('/api/servers/{server_id}/connections/add', tags=["Connections"])
+@serialize_peer_lifecycle
 def api_add_connection(request: Request, server_id: int, req: AddConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6136,8 +6186,11 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
+        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol, client_id=req.client_id)
+        if guard is not None:
+            return guard
         server = data['servers'][server_id]
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
@@ -6146,12 +6199,8 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
         manager = get_protocol_manager(ssh, req.protocol)
         _manager_call(manager, 'remove_client', req.protocol, req.client_id)
         ssh.disconnect()
-        # Remove from user_connections
-        data['user_connections'] = [
-            c for c in data.get('user_connections', [])
-            if not (c.get('client_id') == req.client_id and c.get('server_id') == server_id)
-        ]
-        save_data(data)
+        # The preflight proved this peer has no local owner. Do not save
+        # the pre-SSH JSON: unrelated traffic/access commits can occur meanwhile.
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error removing connection")
@@ -6159,6 +6208,7 @@ def api_remove_connection(request: Request, server_id: int, req: ConnectionActio
 
 
 @app.post('/api/servers/{server_id}/connections/edit', tags=["Connections"])
+@serialize_peer_lifecycle
 def api_edit_connection(request: Request, server_id: int, req: EditConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6211,6 +6261,7 @@ def api_clear_conn_warnings(request: Request, server_id: int, req: ConnectionAct
 
 
 @app.post('/api/servers/{server_id}/connections/rename', tags=["Connections"])
+@serialize_peer_lifecycle
 async def api_rename_connection(request: Request, server_id: int, req: RenameConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6319,6 +6370,7 @@ async def api_set_connection_speed(request: Request, server_id: int, req: Connec
 
 
 @app.post('/api/servers/{server_id}/connections/config/save', tags=["Connections"])
+@serialize_peer_lifecycle
 def api_save_connection_config(request: Request, server_id: int, req: SaveConnectionConfigRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6384,6 +6436,7 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
 
 
 @app.post('/api/servers/{server_id}/connections/toggle', tags=["Connections"])
+@serialize_peer_lifecycle
 def api_toggle_connection(request: Request, server_id: int, req: ToggleConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6628,11 +6681,17 @@ async def api_delete_user(request: Request, user_id: str):
     if cur['id'] == user_id:
         return JSONResponse({'error': _t('cannot_delete_self', lang)}, status_code=400)
     try:
-        data = load_data()
-        success = await asyncio.to_thread(perform_delete_user, data, user_id)
-        if not success:
-            return JSONResponse({'error': 'User not found'}, status_code=404)
-        save_data(data)
+        # A linked user is rejected without SSH; deleting an empty user is a
+        # short local mutation. Resolve it under the lock so concurrent linking
+        # cannot disappear through the previous stale snapshot save.
+        async with DATA_LOCK:
+            data = load_data()
+            guard = _traffic_removal_guard(data, user_ids={user_id})
+            if guard is not None:
+                return guard
+            if not perform_delete_user(data, user_id):
+                return JSONResponse({'error': 'User not found'}, status_code=404)
+            save_data(data)
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error deleting user")
@@ -6691,6 +6750,7 @@ async def api_reset_user_traffic(request: Request, user_id: str):
 
 
 @app.post('/api/users/{user_id}/connections/add', tags=["Users"])
+@serialize_peer_lifecycle
 async def api_add_user_connection(request: Request, user_id: str, req: AddUserConnectionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -6797,6 +6857,7 @@ class UnlinkConnectionRequest(BaseModel):
 
 
 @app.post('/api/users/{user_id}/connections/unlink', tags=["Users"])
+@serialize_peer_lifecycle
 async def api_unlink_user_connection(request: Request, user_id: str, req: UnlinkConnectionRequest):
     """Retain the accounting owner until a peer can be safely finalized.
 
@@ -6808,20 +6869,22 @@ async def api_unlink_user_connection(request: Request, user_id: str, req: Unlink
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     async with DATA_LOCK:
         data = load_data()
-        connection = next((c for c in data.get('user_connections', [])
-                           if c.get('user_id') == user_id
-                           and c.get('server_id') == req.server_id
-                           and c.get('protocol') == req.protocol
-                           and c.get('client_id') == req.client_id), None)
-        if connection is None:
+        guard = _traffic_removal_guard(data, server_id=req.server_id, protocol=req.protocol,
+                                      client_id=req.client_id, user_ids={user_id})
+        if guard is not None:
+            return guard
+        before = len(data.get('user_connections', []))
+        data['user_connections'] = [
+            c for c in data.get('user_connections', [])
+            if not (c.get('user_id') == user_id
+                    and c.get('server_id') == req.server_id
+                    and c.get('protocol') == req.protocol
+                    and c.get('client_id') == req.client_id)
+        ]
+        if len(data['user_connections']) == before:
             return JSONResponse({'error': 'Connection link not found'}, status_code=404)
-        # The current managers provide no quiesced, durable final counter
-        # receipt. Do not turn a working peer into unaccounted access, even
-        # when its owner's quota is unlimited or a local flag says disabled.
-        return JSONResponse({
-            'error': 'Peer traffic must be finalized before unlinking',
-            'code': 'traffic_finalization_required',
-        }, status_code=409)
+        save_data(data)
+        return {'status': 'success'}
 
 
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
@@ -7542,6 +7605,9 @@ async def api_sync_delete(request: Request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
     to_delete_ids = [u['id'] for u in data['users'] if u.get('remnawave_uuid')]
+    guard = _traffic_removal_guard(data, user_ids=set(to_delete_ids))
+    if guard is not None:
+        return guard
     if to_delete_ids:
         await perform_mass_operations(delete_uids=to_delete_ids)
     return {'status': 'success', 'count': len(to_delete_ids)}
@@ -7675,7 +7741,8 @@ def api_backup_download(request: Request):
 
 @app.post('/api/settings/backup/restore', tags=["Settings"])
 @serialize_peer_lifecycle
-async def api_backup_restore(request: Request, file: UploadFile = File(...)):
+async def api_backup_restore(request: Request, file: UploadFile = File(...),
+                             operation_id: Optional[str] = Form(None)):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -7689,8 +7756,8 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
             return JSONResponse({'error': 'Empty file'}, status_code=400)
         
         try:
-            backup_data = json.loads(content)
-        except (json.JSONDecodeError, UnicodeDecodeError):
+            backup_data = validate_backup(content)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecoveryError):
             return JSONResponse({'error': 'Invalid JSON format'}, status_code=400)
 
         # Basic structure validation
@@ -7709,13 +7776,161 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
         # so the file on disk is complete without waiting for the next restart.
         backfill_server_uids(backup_data['servers'])
         async with DATA_LOCK:
-            save_data(backup_data)
+            # Even identical-looking old backups can rewind traffic baselines.
+            current = load_data()
+            actor = str(get_current_user(request)['id'])
+            store = RecoveryStore(DATA_FILE)
+            op = operation_id if isinstance(operation_id, str) else secrets.token_hex(16)
+            intent = recovery_digest({'backup_sha256': hashlib.sha256(content).hexdigest()})
+            replay = store.replay(op, actor, 'ordinary_restore', intent)
+            if replay:
+                return replay
+            guard = _traffic_removal_guard(current, include_archived=True)
+            if guard is not None:
+                guard.body = json.dumps({'error': 'Ordinary restore cannot rewind owned usage. Use the offline administrator disaster-recovery workflow.',
+                                         'code': 'traffic_finalization_required',
+                                         'recovery': 'scripts/panel_recovery.py'}).encode()
+                guard.headers['content-length'] = str(len(guard.body))
+                return guard
+            with STATE_FILE_LOCK:
+                check_create_journal(DATA_FILE, replacement=backup_data)
+                before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''
+                result = store.commit(op, actor, 'ordinary_restore', intent, before, backup_data)
         
-        # In a real app we might want to restart or re-init background tasks
-        return {'status': 'success'}
+        # Full disaster recovery is deliberately separate and offline; see
+        # scripts/panel_recovery.py. Never use a force flag on this endpoint.
+        return result if isinstance(operation_id, str) else {'status': 'success'}
     except Exception as e:
         logger.exception("Error during restore")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+class OrphanRecoveryRequest(BaseModel):
+    operation_id: str
+    connection_id: str
+    expected_digest: str
+    expected_peer_digest: str
+    mode: str
+    target_user_id: Optional[str] = None
+    confirmation: str
+
+
+@app.get('/api/recovery/status', tags=['Settings'])
+def api_recovery_status(request: Request):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    return peer_lifecycle_lock.diagnostics()
+
+
+def _read_orphan_peers(server, conn, strict_absence=False):
+    ssh = get_ssh(server)
+    try:
+        ssh.connect()
+        manager = get_protocol_manager(ssh, conn['protocol'])
+        clients = _manager_call(manager, 'get_clients', conn['protocol'])
+        if not isinstance(clients, list) or any(not isinstance(c, dict) or not isinstance(c.get('clientId'), str) for c in clients):
+            raise RecoveryError('incomplete_peer_state')
+        peers = [c for c in clients if c['clientId'] == conn['client_id']]
+        if len(peers) > 1:
+            raise RecoveryError('peer_identity_ambiguous')
+        if strict_absence:
+            verify_awg_peer_absent(ssh, conn['protocol'], conn['client_id'])
+        return peers
+    finally:
+        ssh.disconnect()
+
+
+@app.get('/api/recovery/orphans/{connection_id}', tags=['Settings'])
+def api_orphan_recovery_preview(request: Request, connection_id: str):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        conn, server, scope = orphan_scope(data, connection_id)
+        peers = _read_orphan_peers(server, conn)
+        return {'scope': scope, 'expected_digest': recovery_digest(data),
+                'expected_peer_digest': recovery_digest(peers),
+                'peer_status': 'present' if peers else 'absence_not_yet_verified',
+                'last_observed_bytes': conn.get('last_bytes'),
+                'counters_verified_final': False,
+                'warning': 'Restore ownership first. Emergency archival requires a verified absent peer; available counters are NOT a final receipt.'}
+    except RecoveryError as error:
+        return JSONResponse({'error': str(error)}, status_code=409)
+
+
+@app.post('/api/recovery/orphans', tags=['Settings'])
+@serialize_peer_lifecycle
+async def api_orphan_recovery(request: Request, req: OrphanRecoveryRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    # A cross-origin browser must not turn confirmation strings into a CSRF bypass.
+    origin = request.headers.get('origin')
+    if origin and origin.rstrip('/') != str(request.base_url).rstrip('/'):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        actor = str(get_current_user(request)['id'])
+        phrases = {'repair': 'RESTORE OWNERSHIP; USAGE IS UNVERIFIED',
+                   'archive_absent': 'ARCHIVE ABSENT PEER; FINAL USAGE IS UNKNOWN'}
+        if req.mode not in phrases or req.confirmation != phrases[req.mode]:
+            raise RecoveryError('explicit_confirmation_required')
+        intent = recovery_digest(req.model_dump())
+        store = RecoveryStore(DATA_FILE)
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                replay = store.replay(req.operation_id, actor, req.mode, intent)
+                if replay:
+                    return replay
+                data = load_data()
+                if recovery_digest(data) != req.expected_digest:
+                    raise RecoveryError('recovery_state_changed')
+                conn, server, scope = orphan_scope(data, req.connection_id)
+                check_create_journal(DATA_FILE, scope=scope)
+                if req.mode == 'repair':
+                    require_repair_target(data, req.target_user_id)
+        # Probe the exact physical protocol instance; no keys/config are returned
+        # to the caller and no DATA_LOCK is held over SSH.
+        peers = await asyncio.to_thread(_read_orphan_peers, server, conn, req.mode == 'archive_absent')
+        if recovery_digest(peers) != req.expected_peer_digest:
+            raise RecoveryError('peer_state_changed')
+        if req.mode == 'repair' and not peers:
+            raise RecoveryError('peer_state_unknown')
+        if req.mode == 'archive_absent' and peers:
+            raise RecoveryError('peer_still_present_restore_ownership_instead')
+        async with DATA_LOCK:
+            with STATE_FILE_LOCK:
+                current = load_data()
+                if recovery_digest(current) != req.expected_digest:
+                    raise RecoveryError('recovery_state_changed')
+                latest, latest_server, latest_scope = orphan_scope(current, req.connection_id)
+                if latest_scope != scope:
+                    raise RecoveryError('peer_identity_changed')
+                before = pathlib_read_data_bytes()
+                # Include the complete original row and last live observation in
+                # the protected snapshot/tombstone, never the public audit summary.
+                observed = (peers[0].get('userData') or {}) if peers else {}
+                counters = {k: observed[k] for k in ('dataReceivedBytes', 'dataSentBytes') if type(observed.get(k)) is int and observed[k] >= 0}
+                evidence = {'operation_id': req.operation_id, 'scope': scope,
+                            'connection': dict(latest), 'observed_counters': counters,
+                            'counters_verified_final': False}
+                current.setdefault('accounting_recoveries', []).append(evidence)
+                if req.mode == 'repair':
+                    latest['user_id'] = req.target_user_id
+                    latest['accounting_recovery_id'] = req.operation_id
+                else:
+                    current['user_connections'] = [c for c in current['user_connections'] if c['id'] != req.connection_id]
+                return store.commit(req.operation_id, actor, req.mode, intent, before, current)
+    except RecoveryError as error:
+        return JSONResponse({'error': str(error), 'code': 'recovery_not_completed'}, status_code=409)
+    except Exception:
+        logger.error('Orphan recovery failed; inspect owner-only recovery journal')
+        return JSONResponse({'error': 'Recovery did not complete. Retry the same operation ID.',
+                             'code': 'recovery_not_completed'}, status_code=503)
+
+
+def pathlib_read_data_bytes():
+    # Kept separate so failure injection can prove there is no destructive write.
+    with open(DATA_FILE, 'rb') as source:
+        return source.read()
 
 
 if __name__ == '__main__':

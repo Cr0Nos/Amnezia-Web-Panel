@@ -274,6 +274,8 @@ class SSHManager:
         _conn_lock is held for the whole command so force_disconnect() (pool
         eviction) cannot tear down the transport mid-command.
         """
+        from peer_lifecycle_lock import check_remote_fence
+        check_remote_fence()
         with self._exec_lock, _conn_lock_of(self):
             return self._run_command_locked(command, timeout, _retried, stdin_input)
 
@@ -293,6 +295,8 @@ class SSHManager:
         except Exception as e:
             # Transport can be dead while is_active() still claims otherwise
             # (silent NAT drop). Reconnect once and retry before giving up.
+            from peer_lifecycle_lock import note_ssh_uncertainty
+            note_ssh_uncertainty()
             if not _retried:
                 logger.warning(f"exec failed ({e}); reconnecting and retrying once")
                 try:
@@ -323,6 +327,8 @@ class SSHManager:
             out = stdout.read().decode('utf-8', errors='replace').strip()
             err = stderr.read().decode('utf-8', errors='replace').strip()
         except Exception as e:
+            from peer_lifecycle_lock import note_ssh_uncertainty
+            note_ssh_uncertainty()
             logger.error(f"Command timed out or failed to read: {e}")
             out, err, exit_code = "", f"SSH connection lost while running the command ({self._reason(e)})", -1
 
