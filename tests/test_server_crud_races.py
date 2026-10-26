@@ -16,7 +16,7 @@ import uuid
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
-from pydantic import BaseModel
+from pydantic import BaseModel, conint
 from typing import List, Optional
 
 FUNCTIONS = {'load_data', 'save_data', 'find_server_by_uid', '_finish_locked_worker',
@@ -51,7 +51,7 @@ class CrudTests(unittest.IsolatedAsyncioTestCase):
                                     forget_entry_peers=AsyncMock(return_value=[]))
         self.p = dict(asyncio=asyncio, os=os, json=json, tempfile=tempfile, uuid=uuid,
                       Request=Request, JSONResponse=JSONResponse, BaseModel=BaseModel,
-                      List=List, Optional=Optional, logger=Mock(), DATA_FILE=str(self.path),
+                      conint=conint, List=List, Optional=Optional, logger=Mock(), DATA_FILE=str(self.path),
                       DEFAULT_MAIL_SETTINGS={}, DEFAULT_SELF_SERVICE_SETTINGS={},
                       DATA_LOCK=asyncio.Lock(), SERVER_MUTATION_LOCK=asyncio.Lock(),
                       _check_admin=lambda r: r.headers.get('x-role', 'admin') == 'admin',

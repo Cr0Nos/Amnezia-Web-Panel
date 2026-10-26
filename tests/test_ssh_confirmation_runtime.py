@@ -30,7 +30,7 @@ class RuntimeTests(http_tests.EnrollmentHTTPTests):
             if not release.wait(5):
                 raise TimeoutError('worker not released')
             return {'status': 'success'}
-        self.trust.enroll.side_effect = enroll
+        self.trust.commit_enrollment.side_effect = enroll
         async def run():
             request = Request({'type': 'http', 'headers': []})
             task = asyncio.create_task(self.module.api_ssh_trust_confirm(request, 0,
