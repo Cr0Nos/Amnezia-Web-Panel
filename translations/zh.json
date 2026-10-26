@@ -143,6 +143,7 @@
   "qr_format_amnezia_hint": "面向 AmneziaVPN 的动画序列，包含服务器名称。请保持摄像头对准，直到读取全部帧 —",
   "qr_format_wireguard_hint": "原样的配置或链接，适用于 AmneziaWG、wg-quick 及其他客户端，不包含服务器名称。",
   "no_data": "无数据",
+  "peer_endpoint": "公网端点",
   "start_btn": "▶ 启动",
   "stop_btn": "⏹ 停止",
   "config_btn": "⚙️ 配置",
