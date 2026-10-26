@@ -8,8 +8,8 @@ import functools
 
 
 FINALIZATION_MESSAGE = (
-    'Final traffic accounting is required before removing a user-linked peer. '
-    'Keep the connection linked until a verified final counter receipt is available.'
+    "This connection can't be removed right now because its usage accounting "
+    'is still being finalized. Please contact your administrator.'
 )
 
 
@@ -40,13 +40,20 @@ def _protocol_scope(protocol):
 
 
 def require_unowned(data, *, server_id=None, protocol=None, client_id=None,
-                    user_ids=None):
+                    user_ids=None, include_archived=False):
     """Reject a destructive scope containing any accounting ownership record.
 
     Match the exact protocol instance, not its base name. A dangling user ID is
     still ownership: deleting a user elsewhere is not finalization evidence.
     """
-    for conn in data.get('user_connections', []):
+    connections = list(data.get('user_connections', []))
+    if include_archived:
+        for recovery in data.get('accounting_recoveries', []):
+            conn = dict(recovery['connection'])
+            uid = recovery['scope']['server_uid']
+            conn['server_id'] = next((i for i, s in enumerate(data.get('servers', [])) if s.get('uid') == uid), None)
+            connections.append(conn)
+    for conn in connections:
         if server_id is not None and conn.get('server_id') != server_id:
             continue
         if protocol is not None and _protocol_scope(conn.get('protocol')) != _protocol_scope(protocol):

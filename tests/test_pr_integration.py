@@ -21,8 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class IntegrationTests(unittest.TestCase):
-    def test_unlink_only_removes_exact_panel_link(self):
-        link = dict(user_id='u', server_id=0, protocol='wg', client_id='peer')
+    def test_unlink_retains_accounting_owner_until_finalization(self):
+        link = dict(user_id='u', server_id=0, protocol='wg', client_id='peer', last_bytes=60)
         retained = dict(link, user_id='other')
         data = {'user_connections': [link, retained]}
         with patch.object(panel, '_check_admin', return_value=True), \
@@ -30,9 +30,11 @@ class IntegrationTests(unittest.TestCase):
              patch.object(panel, 'save_data') as save, \
              patch.object(panel, 'get_ssh', side_effect=AssertionError('unlink must not use SSH')):
             result = asyncio.run(panel.api_unlink_user_connection(Mock(), 'u', panel.UnlinkConnectionRequest(server_id=0, protocol='wg', client_id='peer')))
-            self.assertEqual(result, {'status': 'success'})
-            self.assertEqual(data['user_connections'], [retained])
-            save.assert_called_once_with(data)
+            self.assertEqual(result.status_code, 409)
+            self.assertEqual(json.loads(result.body)['code'], 'traffic_finalization_required')
+            self.assertEqual(data['user_connections'], [link, retained])
+            self.assertEqual(link['last_bytes'], 60)
+            save.assert_not_called()
 
     def test_ssh_failure_cooldown_prevents_reconnect_storm(self):
         ssh = SSHManager('192.0.2.1', 22, 'root', 'fake')

@@ -257,7 +257,9 @@ class ConnectionService:
                 # Keeping an owner is mandatory until stopped-peer counters can
                 # be durably settled. Disabling metadata is not such a receipt.
                 from peer_accounting import FINALIZATION_MESSAGE
-                raise SelfServiceError(FINALIZATION_MESSAGE, status_code=409)
+                error = SelfServiceError(FINALIZATION_MESSAGE, status_code=409)
+                error.code = 'traffic_finalization_required'
+                raise error
 
     def _settings(self, data):
         settings = dict(DEFAULT_SELF_SERVICE_SETTINGS)

@@ -2,6 +2,7 @@
 import asyncio
 import copy
 import io
+import html
 import json
 import threading
 import unittest
@@ -13,7 +14,7 @@ from fastapi import UploadFile
 import app as panel
 import telegram_bot
 from connection_service import SelfServiceError
-from peer_accounting import TrafficFinalizationRequired, require_unowned, serialize_peer_lifecycle
+from peer_accounting import FINALIZATION_MESSAGE, TrafficFinalizationRequired, require_unowned, serialize_peer_lifecycle
 from tests import test_connection_service as fixtures
 
 
@@ -157,7 +158,7 @@ class DestructiveAccountingGuards(unittest.IsolatedAsyncioTestCase):
                 lambda: copy.deepcopy(self.data), self.save)
         ssh.assert_not_called()
         self.save.assert_not_called()
-        self.assertIn('Final traffic accounting', api.edit_message.call_args.args[2])
+        self.assertIn(FINALIZATION_MESSAGE, html.unescape(api.edit_message.call_args.args[2]))
 
     async def test_concurrent_link_cannot_be_bypassed_by_raw_remove(self):
         entered, release = threading.Event(), threading.Event()
