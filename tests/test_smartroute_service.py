@@ -185,7 +185,10 @@ class SmartRouteServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.awg.exit_applies, ['awg2'])
         self.assertEqual(out['rolled_back'], ['awg2'])
 
-    async def test_uninstall_survives_container_rollback_failure(self):
+    async def test_uninstall_aborts_when_container_rollback_fails(self):
+        # Review hardening: proceeding after a failed rollback would delete
+        # the markers/timer and strand throw routes nobody manages. Fail-stop
+        # leaves the app fully intact so the uninstall can be retried.
         original = FakeSRM.disable_instance
 
         def flaky(self, container, config_path, subnet_default):
@@ -194,11 +197,15 @@ class SmartRouteServiceTest(unittest.IsolatedAsyncioTestCase):
             return original(self, container, config_path, subnet_default)
 
         with mock.patch.object(FakeSRM, 'disable_instance', flaky):
-            out = await self.svc.uninstall(0)
-        self.assertEqual(out['status'], 'success')
-        self.assertIn(('uninstall',), FakeSRM.calls)
+            with self.assertRaises(SmartRouteError) as ctx:
+                await self.svc.uninstall(0)
+        self.assertEqual(ctx.exception.code, 'rollback_incomplete')
+        self.assertEqual(ctx.exception.status_code, 409)
+        # no host cleanup ran, nothing recorded as removed
+        self.assertNotIn(('uninstall',), FakeSRM.calls)
+        self.assertTrue(self.store['data']['servers'][0]['smartroute']['installed'])
         link = self.store['data']['servers'][0]['protocols']['awg2']['exit_link']
-        self.assertTrue(link['smart_route_lost'])
+        self.assertFalse(link.get('smart_route_lost', False))
 
     async def test_uninstall_without_splits(self):
         self.store['data']['servers'][0]['protocols']['awg2']['exit_link']['smart_route'] = False
@@ -361,16 +368,21 @@ class SmartRouteServiceTest(unittest.IsolatedAsyncioTestCase):
                        '/opt/amnezia/awg/awg2/wg0.conf', SUBNET_DEFAULT),
                       FakeSRM.calls)
 
-    async def test_set_enabled_partial_failure_reported(self):
+    async def test_set_enabled_partial_failure_aborts_without_recording(self):
+        # Review hardening: a partial pause/resume must NOT be recorded as the
+        # new global state - the panel would report a state at least one
+        # container does not have. Fail-stop keeps the old flag (retryable).
         def flaky(self_, container, config_path, subnet_default):
             raise RuntimeError('docker exec failed')
         with mock.patch.object(FakeSRM, 'disable_instance', flaky):
-            out = await self.svc.set_enabled(0, False)
-        self.assertEqual(out['status'], 'success')
-        self.assertEqual(out['applied'], [])
-        self.assertEqual(len(out['failed']), 1)
-        # the flag still flips — the instance can be fixed and re-resumed
-        self.assertFalse(self.store['data']['servers'][0]['smartroute']['enabled'])
+            with self.assertRaises(SmartRouteError) as ctx:
+                await self.svc.set_enabled(0, False)
+        self.assertEqual(ctx.exception.code, 'partial_failure')
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertIn('awg2', str(ctx.exception))
+        # the stored flag is untouched (absent means default-enabled), so
+        # retrying the pause is safe
+        self.assertTrue(self.store['data']['servers'][0]['smartroute'].get('enabled', True))
 
     async def test_status_reports_enabled_and_dns_pair(self):
         out = await self.svc.status(0)

@@ -818,6 +818,8 @@
     "smartroute_enabled_toast": "Smart Route enabled",
     "smartroute_paused_toast": "Smart Route disabled, split instances are back on the exit node",
     "smartroute_partial_failure": "Not applied to {n} instance(s) — see the panel log",
+    "partial_failure": "Operation did not complete for every instance. Nothing was changed — fix the cause and retry.",
+    "rollback_incomplete": "Rollback failed for an instance. The app is left intact — retry the operation.",
     "smartroute_direct_dns": "DNS for local (RU) traffic",
     "smartroute_exit_dns": "DNS for external traffic",
     "smartroute_dns_pair_hint": "The pair is written into split-instance client configs: queries to the local resolver go direct, to the external one via the exit node. Applies to newly exported configs.",

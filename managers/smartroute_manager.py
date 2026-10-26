@@ -145,23 +145,55 @@ def parse_acct_counters(text):
 # Runs INSIDE the container: refresh throw routes only. The default/blackhole
 # routes of the exit table are untouched. The merged prefix list must already
 # be at /tmp/smartr_v4.cidr (docker cp'd by the caller).
+#
+# Hardened against partial application (review feedback): the previous throw
+# set is snapshotted first; a failed or incomplete add restores it, so the
+# kernel never sits in a half-applied state the panel does not know about.
+# APPLY_RC: 0 = applied and verified, 2 = apply failed but last-known-good
+# restored, 1 = apply failed AND restore incomplete (routing state unknown).
 CONTAINER_APPLY_SCRIPT = """\
 set -u
 TABLE=__TABLE__
+APPLY_RC=0
+ip -4 route show table $TABLE | awk '$1==\"throw\"{print $2}' > /tmp/smartr_lkg.cidr
 ip -4 route show table $TABLE | awk '$1==\"throw\"{print \"route del throw \"$2\" table '$TABLE'\"}' > /tmp/smartr_del.batch
 [ -s /tmp/smartr_del.batch ] && ip -4 -batch /tmp/smartr_del.batch 2>/dev/null
 if [ -s /tmp/smartr_v4.cidr ]; then
   awk 'NF{print \"route add throw \"$1\" table '$TABLE'\"}' /tmp/smartr_v4.cidr > /tmp/smartr_add.batch
-  ip -4 -batch /tmp/smartr_add.batch 2>&1 || true
+  ip -4 -batch /tmp/smartr_add.batch 2>/dev/null || APPLY_RC=1
 fi
-echo "smartroute: $(ip -4 route show table $TABLE | grep -c '^throw') throw routes in table $TABLE"
+WANT=$(grep -c / /tmp/smartr_v4.cidr 2>/dev/null || echo 0)
+GOT=$(ip -4 route show table $TABLE | grep -c '^throw')
+if [ "$APPLY_RC" != 0 ] || [ "$WANT" != "$GOT" ]; then
+  echo "smartroute: apply mismatch (wanted $WANT, have $GOT) - restoring last-known-good"
+  ip -4 route show table $TABLE | awk '$1==\"throw\"{print \"route del throw \"$2\" table '$TABLE'\"}' | ip -4 -batch 2>/dev/null
+  awk 'NF{print \"route add throw \"$1\" table '$TABLE'\"}' /tmp/smartr_lkg.cidr | ip -4 -batch 2>/dev/null
+  RESTORED=$(ip -4 route show table $TABLE | grep -c '^throw')
+  LKG=$(grep -c / /tmp/smartr_lkg.cidr 2>/dev/null || echo 0)
+  if [ "$RESTORED" != "$LKG" ]; then
+    echo "smartroute: CRITICAL - restore incomplete ($RESTORED of $LKG), routing state unknown"
+    APPLY_RC=1
+  else
+    echo "smartroute: restored $RESTORED last-known-good routes"
+    APPLY_RC=2
+  fi
+else
+  echo "smartroute: $GOT throw routes in table $TABLE"
+fi
+"""
+
+# Standalone variant: propagate the apply verdict to the caller's exit code
+# so docker exec reports failure and the panel does not record success.
+CONTAINER_APPLY_FINAL = CONTAINER_APPLY_SCRIPT + """\
+exit $APPLY_RC
 """
 
 # Runs INSIDE the container when split routing is enabled: the accounting
 # chain (mangle/POSTROUTING, never FORWARD/OUTPUT - blockers own those) and
 # a conntrack flush so flows reopen on the new path (same rationale as
 # x_link_up). X_SUBNET is read from the instance config, like the x_ block.
-CONTAINER_ENABLE_SCRIPT = CONTAINER_APPLY_SCRIPT + """
+CONTAINER_ENABLE_SCRIPT = CONTAINER_APPLY_SCRIPT + """\
+[ "$APPLY_RC" = 0 ] || exit $APPLY_RC
 X_SUBNET=$(grep '^Address' __CONF__ | head -1 | cut -d= -f2 | cut -d, -f1 | tr -d ' ')
 [ -n "$X_SUBNET" ] || X_SUBNET=__SUBNET_DEFAULT__
 CH=__CHAIN__
@@ -235,7 +267,7 @@ def build_update_script():
     """The host-side /usr/local/sbin/smartroute-update.sh."""
     sources_v4 = ' '.join(SOURCES_V4)
     sources_v6 = ' '.join(SOURCES_V6)
-    apply = CONTAINER_APPLY_SCRIPT.replace('__TABLE__', str(SMARTR_TABLE))
+    apply = CONTAINER_APPLY_FINAL.replace('__TABLE__', str(SMARTR_TABLE))
     return f'''#!/bin/bash
 # Smart Route prefix updater (panel-managed, host-level). Downloads the RU
 # prefix list with source fallback + a <{SMARTR_MIN_PREFIXES} guard, stores
@@ -317,8 +349,11 @@ apply_instances() {{ # push the merged list into every marked container
     c=$(basename "$marker")
     docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qx "$c" || continue
     docker cp "$merged" "$c:/tmp/smartr_v4.cidr" 2>/dev/null || {{ log "apply: $c unreachable, skipped"; continue; }}
-    docker exec -i "$c" bash -s <<'APPEOF'
+    if ! docker exec -i "$c" bash -s <<'APPEOF'
 {apply}APPEOF
+    then
+      log "apply: $c failed - last-known-good restored, retrying on the next update"
+    fi
   done
   rm -f "$merged"
 }}
@@ -406,16 +441,30 @@ def build_remove_script():
                                       .replace('__SUBNET_DEFAULT__', '')
     return f'''#!/bin/bash
 set -u
+CLEANUP_FAILED=0
 if [ -d {SMARTR_INSTANCES} ]; then
   for marker in {SMARTR_INSTANCES}/*; do
     [ -f "$marker" ] || continue
     c=$(basename "$marker")
     docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qx "$c" || continue
-    docker exec -i "$c" bash -s <<'DISEOF'
+    if ! docker exec -i "$c" bash -s <<'DISEOF'
 {disable}DISEOF
+    then
+      echo "smartroute: WARNING - cleanup of $c failed (exit $?)"
+      CLEANUP_FAILED=1
+    fi
   done
 fi
-systemctl disable --now smartroute.timer smartroute.service >/dev/null 2>&1
+# A failed container cleanup must NOT be masked by the host cleanup below:
+# markers, timer and files stay in place so the next uninstall can retry
+# instead of stranding throw routes nobody manages.
+if [ "$CLEANUP_FAILED" != 0 ]; then
+  echo "smartroute: container cleanup incomplete - markers kept, retry uninstall"
+  exit 1
+fi
+if ! systemctl disable --now smartroute.timer smartroute.service >/dev/null 2>&1; then
+  echo "smartroute: WARNING - could not disable the timer/service"
+fi
 rm -f /etc/systemd/system/smartroute.timer /etc/systemd/system/smartroute.service
 systemctl daemon-reload
 rm -rf {SMARTR_DIR}
@@ -552,17 +601,22 @@ class SmartRouteManager:
         return self._container_run(container, script)
 
     def disable_instance(self, container, config_path, subnet_default):
-        """Drop marker + throws + accounting; traffic falls back to the exit."""
-        self.ssh.run_sudo_command(f'rm -f {SMARTR_INSTANCES}/{container}')
+        """Drop throws + accounting; traffic falls back to the exit. The
+        marker goes only after a successful cleanup: while it exists, the
+        hourly update keeps refreshing the (still-applied) routes and a retry
+        remains possible. Removing it first would strand a failed container
+        in a state nothing manages."""
         script = render_container_script(
             CONTAINER_DISABLE_SCRIPT, config_path=config_path, subnet_default=subnet_default)
-        return self._container_run(container, script)
+        result = self._container_run(container, script)
+        self.ssh.run_sudo_command(f'rm -f {SMARTR_INSTANCES}/{container}')
+        return result
 
     def refresh_instance(self, container):
         """Re-apply the current lists to one container (after list edits)."""
         self._push_merged_list(container)
         script = render_container_script(
-            CONTAINER_APPLY_SCRIPT, config_path='/opt/amnezia/awg/awg0.conf',
+            CONTAINER_APPLY_FINAL, config_path='/opt/amnezia/awg/awg0.conf',
             subnet_default='')
         return self._container_run(container, script)
 

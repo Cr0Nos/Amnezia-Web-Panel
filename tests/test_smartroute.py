@@ -7,7 +7,8 @@ serve canned answers.
 import unittest
 
 from managers.smartroute_manager import (
-    CONTAINER_APPLY_SCRIPT, CONTAINER_DISABLE_SCRIPT, CONTAINER_ENABLE_SCRIPT,
+    CONTAINER_APPLY_FINAL, CONTAINER_APPLY_SCRIPT,
+    CONTAINER_DISABLE_SCRIPT, CONTAINER_ENABLE_SCRIPT,
     SMARTR_ACCT_CHAIN, SMARTR_ACCT_CHAIN_IN,
     SMARTR_INSTANCES, SMARTR_MIN_PREFIXES, SMARTR_TABLE,
     SmartRouteManager, SmartRouteError, SOURCES_V4, SOURCES_V6,
@@ -322,6 +323,67 @@ class ManagerFlowTests(unittest.TestCase):
         self.assertEqual(out['via_exit_in'], {'pkts': 3, 'bytes': 300})
         self.assertEqual(out['direct_out'], {'pkts': 5, 'bytes': 500})
         self.assertEqual(out['throw_routes'], 37)
+
+    def test_disable_keeps_marker_when_container_cleanup_fails(self):
+        # Retryable state (review hardening): the marker must survive a
+        # failed container cleanup — while it exists the hourly update keeps
+        # refreshing the still-applied routes and a retry stays possible.
+        class FailSSH(FakeSSH):
+            def run_sudo_command(self, cmd, timeout=60):
+                super().run_sudo_command(cmd, timeout)
+                if 'docker exec' in cmd:
+                    return 'boom', '', 1
+                return '', '', 0
+
+        ssh = FailSSH()
+        with self.assertRaises(SmartRouteError):
+            SmartRouteManager(ssh).disable_instance(
+                'amnezia-awg2', '/opt/amnezia/awg/awg0.conf', '10.8.0.0/24')
+        cmds = ' '.join(ssh.commands)
+        self.assertNotIn(f'rm -f {SMARTR_INSTANCES}/amnezia-awg2', cmds)
+
+
+class ApplyHardeningTests(unittest.TestCase):
+    """Regression tests for partial route-application failures (review feedback)."""
+
+    def test_apply_snapshots_routes_before_delete(self):
+        # last-known-good snapshot must exist BEFORE the del batch runs,
+        # otherwise a restore has nothing to fall back to
+        self.assertIn('/tmp/smartr_lkg.cidr', CONTAINER_APPLY_SCRIPT)
+        self.assertLess(CONTAINER_APPLY_SCRIPT.index('smartr_lkg.cidr'),
+                        CONTAINER_APPLY_SCRIPT.index('smartr_del.batch'))
+
+    def test_apply_add_errors_are_not_swallowed(self):
+        # the old script masked add failures with `|| true`, leaving the
+        # kernel in a half-applied state; the verdict must drive a restore
+        self.assertNotIn('smartr_add.batch 2>&1 || true', CONTAINER_APPLY_SCRIPT)
+        self.assertIn('restoring last-known-good', CONTAINER_APPLY_SCRIPT)
+        self.assertIn('restore incomplete', CONTAINER_APPLY_SCRIPT)
+
+    def test_apply_verdict_reaches_the_caller(self):
+        # standalone apply must exit non-zero (2 = restored, 1 = unknown)
+        # so docker exec reports failure and callers never record success
+        self.assertTrue(CONTAINER_APPLY_FINAL.rstrip().endswith('exit $APPLY_RC'))
+        self.assertIn('exit $APPLY_RC', CONTAINER_ENABLE_SCRIPT)
+
+    def test_update_script_checks_apply_result(self):
+        script = build_update_script()
+        self.assertIn('retrying on the next update', script)
+
+    def test_remove_script_aborts_on_container_cleanup_failure(self):
+        # host cleanup must not mask a failed container cleanup: markers
+        # and timer stay so the next uninstall can retry
+        script = build_remove_script()
+        self.assertIn('CLEANUP_FAILED=1', script)
+        self.assertIn('markers kept, retry uninstall', script)
+        self.assertLess(script.index('markers kept, retry uninstall'),
+                        script.index('rm -rf /etc/smartroute'))
+
+    def test_enable_guards_on_apply_failure(self):
+        # accounting chains must not be configured when the route apply
+        # failed - the guard exits before the iptables part
+        self.assertLess(CONTAINER_ENABLE_SCRIPT.index('[ "$APPLY_RC" = 0 ] || exit $APPLY_RC'),
+                        CONTAINER_ENABLE_SCRIPT.index('iptables -t mangle -N $CH'))
 
 
 if __name__ == '__main__':

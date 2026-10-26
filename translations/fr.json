@@ -818,6 +818,8 @@
     "smartroute_enabled_toast": "Smart Route activé",
     "smartroute_paused_toast": "Smart Route désactivé, les instances en split retournent vers le nœud de sortie",
     "smartroute_partial_failure": "Non appliqué à {n} instance(s) — voir le journal du panneau",
+    "partial_failure": "L'opération ne s'est pas terminée pour toutes les instances. Rien n'a changé — corrigez la cause et réessayez.",
+    "rollback_incomplete": "Le retour arrière d'une instance a échoué. L'application est restée intacte — réessayez l'opération.",
     "smartroute_direct_dns": "DNS pour le trafic local (RU)",
     "smartroute_exit_dns": "DNS pour le trafic externe",
     "smartroute_dns_pair_hint": "La paire est écrite dans les configs clients des instances en split : les requêtes vers le résolveur local passent en direct, vers l'externe via le nœud de sortie. S'applique aux nouvelles configurations exportées.",

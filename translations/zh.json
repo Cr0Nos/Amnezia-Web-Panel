@@ -818,6 +818,8 @@
     "smartroute_enabled_toast": "Smart Route 已启用",
     "smartroute_paused_toast": "Smart Route 已停用，分流实例已回退到出口节点",
     "smartroute_partial_failure": "未应用到 {n} 个实例 — 详见面板日志",
+    "partial_failure": "操作未能在所有实例上完成。未做任何更改 — 请排除原因后重试。",
+    "rollback_incomplete": "某个实例的回滚失败。应用保持原样 — 请重试该操作。",
     "smartroute_direct_dns": "本地（RU）流量的 DNS",
     "smartroute_exit_dns": "外部流量的 DNS",
     "smartroute_dns_pair_hint": "该 DNS 对会写入分流实例的客户端配置：对本地解析器的查询直连，对外部解析器的查询经由出口节点。适用于新导出的配置。",

@@ -3661,7 +3661,7 @@
         await exitLinkRequest('/relink', { protocol: currentExitLinkProto }, 'exit_link_saved');
     }
 
-    const SMARTR_ERROR_KEYS = ['app_not_installed', 'not_linked', 'protocol_not_awg', 'invalid_cidr', 'invalid_dns', 'smartroute_paused', 'server_not_found'];
+    const SMARTR_ERROR_KEYS = ['app_not_installed', 'not_linked', 'protocol_not_awg', 'invalid_cidr', 'invalid_dns', 'smartroute_paused', 'server_not_found', 'partial_failure', 'rollback_incomplete'];
 
     function smartrouteErrorText(err) {
         return SMARTR_ERROR_KEYS.includes(err.message) ? _(err.message) : err.message;
@@ -3709,9 +3709,6 @@
         try {
             const res = await apiCall(`/api/servers/${SERVER_ID}/smartroute/enable`, 'POST', { enabled: !!enable });
             showToast(_(enable ? 'smartroute_enabled_toast' : 'smartroute_paused_toast'), 'success');
-            if (res.failed && res.failed.length) {
-                showToast(_('smartroute_partial_failure').replace('{n}', res.failed.length), 'error');
-            }
             smartRouteStatus = await loadSmartRouteStatus();
             renderSmartRouteCard();
             renderMarketplace();

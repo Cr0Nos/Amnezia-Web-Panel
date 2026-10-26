@@ -196,6 +196,7 @@ class SmartRouteService:
         # 1) Per-container rollback FIRST (containers still exist and are
         #    marked): throw routes out, accounting down, conntrack flushed.
         #    After this the clients are back on "everything via exit0".
+        rollback_failed = []
         for proto, _link in splits:
             try:
                 awg = await self._awg(server)
@@ -205,6 +206,20 @@ class SmartRouteService:
                 await self._apply_dns_for_split(server_id, proto, False)
             except Exception as err:
                 logger.warning("smartroute rollback of %s failed: %s", proto, err)
+                rollback_failed.append({'protocol': proto, 'error': str(err)})
+
+        if rollback_failed:
+            # Fail-stop (review hardening): host cleanup would delete the
+            # markers and timer, stranding throw routes nobody manages and
+            # making the failure irreversible. Keep everything in place so
+            # the uninstall can be retried; nothing is recorded as removed.
+            details = '; '.join(f"{f['protocol']}: {f['error']}"
+                                for f in rollback_failed)
+            raise SmartRouteError(
+                'rollback_incomplete',
+                f"Rollback failed for {len(rollback_failed)} instance(s) "
+                f"({details}). The app is left intact - retry the uninstall.",
+                409)
 
         # 2) Host cleanup (files, timer, leftover markers). Its own container
         #    loop is a no-op now - the markers are already gone.
@@ -286,6 +301,19 @@ class SmartRouteService:
                 logger.warning("smartroute %s of %s failed: %s",
                                'resume' if enabled else 'pause', proto, err)
                 failed.append({'protocol': proto, 'error': str(err)})
+
+        if failed:
+            # Fail-stop (review hardening): recording `enabled` here would
+            # report a state at least one container does not actually have.
+            # The stored flag keeps its previous value, so the operation is
+            # fully retryable; the error names every failed instance.
+            details = '; '.join(f"{f['protocol']}: {f['error']}" for f in failed)
+            raise SmartRouteError(
+                'partial_failure',
+                f"{'Resume' if enabled else 'Pause'} did not complete for "
+                f"{len(failed)} instance(s) ({details}). No state was "
+                f"recorded - fix the cause and retry.",
+                409)
 
         async with self.data_lock:
             data = self.load_data()
