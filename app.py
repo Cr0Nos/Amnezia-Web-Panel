@@ -3635,7 +3635,7 @@ async def api_delete_server(request: Request, server_id: int, server_uid: Option
     selected, error = _server_identity(server_id, server_uid)
     if error is not None:
         return error
-        uid = selected['uid']
+    uid = selected['uid']
     data = load_data()
     guard = _traffic_removal_guard(data, server_id=server_id)
     if guard is not None:

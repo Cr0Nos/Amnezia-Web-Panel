@@ -5,7 +5,10 @@ import threading
 from unittest import mock
 import paramiko
 from starlette.requests import Request
-import test_ssh_enrollment_http as http_tests
+try:
+    from . import test_ssh_enrollment_http as http_tests
+except ImportError:
+    import test_ssh_enrollment_http as http_tests
 from managers import ssh_trust
 
 
