@@ -13,6 +13,7 @@ from unittest.mock import Mock
 from fastapi.responses import JSONResponse
 
 FUNCTIONS = {'_rkn_ssh_run', '_rkn_run_cmd', '_rkn_record',
+             '_rkn_server_index', '_rkn_store_record', '_rkn_drop_record',
              'api_rknblock_install', 'api_rknblock_uninstall',
              'api_rknblock_enable', 'api_rknblock_update'}
 
@@ -39,6 +40,7 @@ def isolated_panel():
         'RKN_SCRIPT_URL': 'https://example.test/rkn.sh',
         'BaseModel': BaseModelStub,
         'asyncio': __import__('asyncio'),
+        'DATA_LOCK': __import__('asyncio').Lock(),
     }
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
     return namespace
@@ -89,7 +91,8 @@ class InstallTests(SshCase):
     def test_install_marks_record_and_clears_cache(self):
         result = self.call()
         self.assertEqual(result, {'status': 'success', 'installed': True, 'enabled': True})
-        self.assertEqual(self.server['rknblock'], {'installed': True, 'enabled': True})
+        self.assertEqual(self.server['rknblock'],
+                         {'installed': True, 'enabled': True, 'last_error': None})
         self.assertEqual(self.ran[0][1], 420)  # install timeout
         self.assertNotIn(0, self.panel['RKN_FLAG_CACHE'])
 
@@ -99,6 +102,21 @@ class InstallTests(SshCase):
         self.assertIsInstance(resp, JSONResponse)
         self.assertEqual(resp.status_code, 500)
         self.assertNotIn('rknblock', self.server)
+
+    def test_install_updates_reloaded_server_by_uid(self):
+        # A long SSH call may be followed by a fresh data.json snapshot and a
+        # reorder. The record must land on the same uid, not a stale object.
+        self.server['uid'] = 'u1'
+        initial = {'servers': [self.server], 'users': [], 'user_connections': []}
+        fresh = {'servers': [{'name': 'B', 'uid': 'u2'},
+                             {'name': 'A', 'uid': 'u1'}],
+                 'users': [], 'user_connections': []}
+        self.panel['load_data'] = Mock(side_effect=[initial, fresh])
+        result = self.call()
+        self.assertEqual(result, {'status': 'success', 'installed': True, 'enabled': True})
+        self.assertNotIn('rknblock', self.server)
+        self.assertEqual(fresh['servers'][1]['rknblock'],
+                         {'installed': True, 'enabled': True, 'last_error': None})
 
     def test_forbidden(self):
         self.panel['_check_admin'] = Mock(return_value=False)
@@ -142,7 +160,8 @@ class EnableTests(SshCase):
         self.server['rknblock'] = {'installed': True, 'enabled': True}
         result = self.call(False)
         self.assertEqual(result, {'status': 'success', 'enabled': False})
-        self.assertEqual(self.server['rknblock'], {'installed': True, 'enabled': False})
+        self.assertEqual(self.server['rknblock'],
+                         {'installed': True, 'enabled': False, 'last_error': None})
         self.assertIn(' off;', self.ran[0][0].split('rkn-extra-block-run.sh', 1)[1])
 
     def test_enable_runs_on(self):
