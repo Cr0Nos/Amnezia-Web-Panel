@@ -3042,6 +3042,63 @@ done < "$BW"
 
         return result
 
+    def peer_is_active(self, protocol_type, client_id):
+        """Read the live interface, not the clientsTable enabled cache."""
+        container = self._container_name(protocol_type)
+        binary = self._wg_binary(protocol_type)
+        path = self._resolve_config_path(protocol_type)
+        iface = self._interface_name(protocol_type, path)
+        out, err, code = self.ssh.run_sudo_command(
+            f'docker exec {container} {binary} show {iface} peers')
+        if code != 0:
+            raise RuntimeError('Unable to verify live peer state')
+        return client_id in out.split()
+
+    @_serialized_table_write
+    def prepare_client(self, protocol_type, operation_id, client_name,
+                       private_key, public_key, server_host, port, public_port=None):
+        """Idempotently reserve an INACTIVE peer before publishing ownership.
+
+        The caller journals operation_id and the keypair before calling SSH.
+        Never writes a [Peer] or syncs the interface. A failed local commit or
+        uncertain SSH response can only leave a disabled, identifiable record.
+        """
+        # Validate the supplied pair before it can reach remote metadata.
+        private = X25519PrivateKey.from_private_bytes(b64decode(private_key, validate=True))
+        derived = b64encode(private.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+        if derived != public_key or str(__import__('uuid').UUID(operation_id)) != operation_id:
+            raise ValueError('Invalid prepared peer identity')
+        clients = self._get_clients_table(protocol_type)
+        matches = [c for c in clients if c.get('clientId') == public_key
+                   or (c.get('userData') or {}).get('panelCreateOperation') == operation_id]
+        if matches:
+            if len(matches) != 1:
+                raise RuntimeError('Conflicting prepared peer ownership')
+            client = matches[0]
+            ud = client.get('userData') or {}
+            if (client.get('clientId') != public_key
+                    or ud.get('panelCreateOperation') != operation_id
+                    or ud.get('clientPrivateKey') != private_key):
+                raise RuntimeError('Prepared peer ownership does not match')
+        else:
+            self._invalidate_config_cache(protocol_type)
+            if (public_key in self._parse_peers_from_config(protocol_type)
+                    or self.peer_is_active(protocol_type, public_key)):
+                raise RuntimeError('Prepared peer already exists without operation ownership')
+            ip = self._get_next_ip(protocol_type)
+            ipv6 = self._get_client_ipv6(protocol_type, ip)
+            ud = {'clientName': client_name, 'clientPrivateKey': private_key,
+                  'clientIp': ip, 'psk': self._get_server_psk(protocol_type),
+                  'enabled': False, 'panelCreateOperation': operation_id,
+                  'creationDate': __import__('datetime').datetime.now().isoformat()}
+            if ipv6:
+                ud['clientIpv6'] = ipv6
+            clients.append({'clientId': public_key, 'userData': ud})
+            self._save_clients_table(protocol_type, clients)
+        return {'client_id': public_key, 'config': self.get_client_config(
+            protocol_type, public_key, server_host, port, public_port=public_port)}
+
     @_serialized_table_write
     def add_client(self, protocol_type, client_name, server_host, port, public_port=None):
         """

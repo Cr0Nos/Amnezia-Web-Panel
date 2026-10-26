@@ -1079,7 +1079,24 @@
                 body.telemt_max_conns = parseInt(document.getElementById('ucTelemtMaxConns').value) || null;
             }
 
+            // Keep the same operation across a timeout/reload. It is not a
+            // credential. Clear it only after a confirmed successful response.
+            const operationKey = 'peer-create:' + JSON.stringify([
+                currentUserId, body.server_id, body.protocol, body.name]);
+            try {
+                let operationId = sessionStorage.getItem(operationKey);
+                if (!operationId) {
+                    const bytes = crypto.getRandomValues(new Uint8Array(16));
+                    bytes[6] = (bytes[6] & 15) | 64;
+                    bytes[8] = (bytes[8] & 63) | 128;
+                    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+                    operationId = `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+                    sessionStorage.setItem(operationKey, operationId);
+                }
+                body.operation_id = operationId;
+            } catch (e) { /* Backend uses a stable request identity fallback. */ }
             const result = await apiCall(`/api/users/${currentUserId}/connections/add`, 'POST', body);
+            try { sessionStorage.removeItem(operationKey); } catch (e) {}
             showToast(_('connection_created').replace('{}', body.name), 'success');
             closeModal('addUserConnModal');
 
