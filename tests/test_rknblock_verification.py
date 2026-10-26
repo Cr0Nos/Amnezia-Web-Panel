@@ -5,6 +5,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = (ROOT / 'scripts' / 'rknblock' / 'rkn-extra-block.sh').read_text(encoding='utf-8')
 INSTALL = (ROOT / 'scripts' / 'rknblock' / 'install-rkn-extra.sh').read_text(encoding='utf-8')
+UNIT = (ROOT / 'scripts' / 'rknblock' / 'rkn-extra-block.service').read_text(encoding='utf-8')
 SERVER_PAGE = (ROOT / 'templates' / 'server.html').read_text(encoding='utf-8')
 
 
@@ -25,6 +26,13 @@ class ScriptVerificationTests(unittest.TestCase):
     def test_installer_propagates_on_failure(self):
         self.assertIn('if ! /usr/local/sbin/rkn-extra-block on; then', INSTALL)
         self.assertIn('exit 1', INSTALL)
+
+    def test_boot_unit_can_be_enabled(self):
+        # Without [Install] the service is not started after reboot, and the
+        # ipset/iptables state (not persistent by itself) stays empty while
+        # the state file still says "on".
+        self.assertIn('[Install]', UNIT)
+        self.assertIn('WantedBy=multi-user.target', UNIT)
 
     def test_status_exposes_machine_readable_health(self):
         self.assertIn('health: ok', SCRIPT)
