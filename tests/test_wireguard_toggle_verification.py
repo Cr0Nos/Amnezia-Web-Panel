@@ -5,9 +5,11 @@ hardening does not apply here). These tests pin the two failure modes that
 left peers half-toggled in production:
 
 * `wg syncconf` returns non-zero, but the clientsTable was already updated;
-* `docker cp` reports success while the container still has the old config.
+* `docker cp` reports success while the container still has the old config;
+* the config file is updated, but the live interface (`wg show`) never
+  picked the change up — a verified file masking a stale kernel state.
 
-In both cases the manager must raise and leave the clientsTable untouched.
+In all cases the manager must raise and leave the clientsTable untouched.
 """
 
 import copy
@@ -57,6 +59,10 @@ class FakeSSH:
         self.skip_copy = skip_copy
         self.fail_sync = fail_sync
         self.fail_readback = False
+        # When True, `wg show` keeps reporting the config as it was at init,
+        # modelling a kernel interface that never picked up the new config.
+        self.stale_iface = False
+        self._config_at_init = config
         self.commands = []
 
     def upload_file(self, content, remote_path):
@@ -85,6 +91,11 @@ class FakeSSH:
             if m.group(1) in self.files:
                 return self.files[m.group(1)], '', 0
             return '', 'No such file or directory', 1
+
+        if re.search(r'docker exec -i \S+ wg show \S+', command):
+            if self.stale_iface:
+                return self._config_at_init, '', 0
+            return self.files.get(CONFIG_PATH, ''), '', 0
 
         return '', '', 0
 
@@ -133,6 +144,31 @@ class WireGuardToggleVerificationTests(unittest.TestCase):
             manager.remove_client(PEER_B)
 
         self.assertEqual(saved, [], 'clientsTable must not change when removal is unverifiable')
+
+    def test_disable_aborts_when_interface_lags_config(self):
+        """File removed the peer but the kernel still serves it: the table
+        must NOT flip to enabled=false (Cr0Nos's file-vs-interface gap)."""
+        manager, ssh, saved = self.make_manager()
+        ssh.stale_iface = True
+
+        with mock.patch('managers.wireguard_manager.time.sleep', return_value=None):
+            with self.assertRaises(RuntimeError):
+                manager.toggle_client(PEER_B, False)
+
+        self.assertEqual(saved, [], 'clientsTable must not mark a peer the interface still serves as off')
+        self.assertNotIn(PEER_B, ssh.files[CONFIG_PATH])
+
+    def test_remove_aborts_when_interface_lags_config(self):
+        """File removal landed, kernel still has the peer: dropping it from
+        the table would orphan a live, unmanaged peer."""
+        manager, ssh, saved = self.make_manager()
+        ssh.stale_iface = True
+
+        with mock.patch('managers.wireguard_manager.time.sleep', return_value=None):
+            with self.assertRaises(RuntimeError):
+                manager.remove_client(PEER_B)
+
+        self.assertEqual(saved, [], 'clientsTable must not drop a peer the interface still serves')
 
 
 if __name__ == '__main__':
