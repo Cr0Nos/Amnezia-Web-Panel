@@ -34,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File, Form
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel, Field, StrictBool, constr
+from pydantic import BaseModel, Field, StrictBool, constr, conint
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -2291,7 +2291,7 @@ class LoginRequest(BaseModel):
 
 class AddServerRequest(BaseModel):
     host: str = ''
-    ssh_port: int = 22
+    ssh_port: conint(strict=True, ge=1, le=65535) = 22
     username: str = ''
     password: str = ''
     private_key: str = ''
@@ -2301,7 +2301,7 @@ class AddServerRequest(BaseModel):
 class EditServerRequest(BaseModel):
     name: str = ''
     host: str = ''
-    ssh_port: int = 22
+    ssh_port: Optional[conint(strict=True, ge=1, le=65535)] = None
     username: str = ''
     # Optional[str] = None lets the client distinguish "leave field as is"
     # (omit / null) from "explicitly clear" (empty string). Both credential
@@ -3233,6 +3233,67 @@ class SSHTrustConfirmation(BaseModel):
     confirmed: StrictBool
 
 
+class SSHOnboardingEndpoint(BaseModel):
+    host: constr(min_length=1, max_length=253)
+    ssh_port: conint(strict=True, ge=1, le=65535) = 22
+    server_uid: Optional[constr(min_length=1, max_length=128)] = None
+
+    class Config:
+        # Inspect/confirm must never receive SSH authentication material.
+        extra = 'forbid'
+
+
+class SSHOnboardingConfirmation(SSHOnboardingEndpoint, SSHTrustConfirmation):
+    pass
+
+
+def _ssh_onboarding_endpoint(req):
+    endpoint = {'host': req.host, 'ssh_port': req.ssh_port,
+                'uid': req.server_uid, 'enrollment_context': 'new-server'}
+    ssh_trust.identity(endpoint)
+    if req.server_uid:
+        current = next((s for s in load_data()['servers'] if s.get('uid') == req.server_uid), None)
+        if current is None:
+            raise ValueError('Server no longer exists; refresh inventory')
+        endpoint['enrollment_context'] = ssh_trust.inventory_binding(current)
+    return endpoint
+
+
+@app.post('/api/ssh-trust/onboarding/inspect', tags=["Servers"])
+async def api_ssh_onboarding_inspect(request: Request, req: SSHOnboardingEndpoint):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        async with DATA_LOCK:
+            endpoint = _ssh_onboarding_endpoint(req)
+        result = await asyncio.to_thread(ssh_trust.inspect, endpoint)
+        async with DATA_LOCK:
+            if endpoint != _ssh_onboarding_endpoint(req):
+                raise ValueError('Server endpoint changed; inspect again')
+        return result
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
+@app.post('/api/ssh-trust/onboarding/confirm', tags=["Servers"])
+async def api_ssh_onboarding_confirm(request: Request, req: SSHOnboardingConfirmation):
+    if not _ssh_trust_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if not req.confirmed:
+        return JSONResponse({'error': 'Explicit confirmation required'}, status_code=400)
+    try:
+        async with DATA_LOCK:
+            endpoint = _ssh_onboarding_endpoint(req)
+            reset_server = next((dict(s) for s in load_data()['servers']
+                                 if s.get('uid') == req.server_uid), None) if req.server_uid else None
+        key = await asyncio.to_thread(ssh_trust.prepare_enrollment, endpoint, req.token)
+        result = await _save_ssh_confirmation(endpoint, req.token, key,
+            lambda: endpoint == _ssh_onboarding_endpoint(req), reset_server)
+        return dict(result, ssh_authenticated=False)
+    except Exception as exc:
+        return JSONResponse({'error': str(exc)}, status_code=409)
+
+
 def _ssh_trust_admin(request):
     # Keep session/Bearer authorization; reject cross-origin browser writes.
     origin = request.headers.get('origin')
@@ -3248,12 +3309,14 @@ def _ssh_trust_admin(request):
 
 
 @app.post('/api/servers/{server_id}/ssh-trust/inspect', tags=["Servers"])
-def api_ssh_trust_inspect(request: Request, server_id: int):
+def api_ssh_trust_inspect(request: Request, server_id: int, server_uid: Optional[str] = None):
     if not _ssh_trust_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     servers = load_data()['servers']
     if not 0 <= server_id < len(servers):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
+    if server_uid is not None and servers[server_id].get('uid') != server_uid:
+        return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
     try:
         return ssh_trust.inspect(servers[server_id])
     except Exception as exc:
@@ -3279,8 +3342,25 @@ async def _finish_locked_worker(function):
     return worker.result()
 
 
+async def _save_ssh_confirmation(endpoint, token, key, unchanged, reset_server):
+    committed = []
+    def commit():
+        result = ssh_trust.commit_enrollment(endpoint, token, key, validate_endpoint=unchanged)
+        committed.append(True)
+        return result
+    try:
+        async with DATA_LOCK:
+            return await _finish_locked_worker(commit)
+    finally:
+        # A pooled transport can be busy with a handshake/command. Wait outside
+        # DATA_LOCK, including if the HTTP request was cancelled during commit.
+        if committed and reset_server is not None:
+            await _finish_locked_worker(lambda: drop_ssh(reset_server))
+
+
 @app.post('/api/servers/{server_id}/ssh-trust/confirm', tags=["Servers"])
-async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation):
+async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustConfirmation,
+                                server_uid: Optional[str] = None):
     if not _ssh_trust_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     if not req.confirmed:
@@ -3289,21 +3369,15 @@ async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustC
     if not 0 <= server_id < len(servers):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     server = servers[server_id]
+    if server_uid is not None and server.get('uid') != server_uid:
+        return JSONResponse({'error': 'Inventory changed; refresh and retry'}, status_code=409)
     try:
+        key = await asyncio.to_thread(ssh_trust.prepare_enrollment, server, req.token)
         def unchanged():
             current = load_data()['servers']
-            return (server_id < len(current) and
-                    all(current[server_id].get(k) == server.get(k)
-                        for k in ('uid', 'host', 'ssh_port')))
-        # Serialize the final endpoint check and trust write with server edits.
-        async with DATA_LOCK:
-            def enroll_and_reset():
-                result = ssh_trust.enroll(server, req.token, validate_endpoint=unchanged)
-                drop_ssh(server)
-                return result
-
-            result = await _finish_locked_worker(enroll_and_reset)
-        return result
+            return any(all(s.get(k) == server.get(k) for k in ('uid', 'host', 'ssh_port'))
+                       for s in current)
+        return await _save_ssh_confirmation(server, req.token, key, unchanged, server)
     except Exception as exc:
         return JSONResponse({'error': str(exc)}, status_code=409)
 
