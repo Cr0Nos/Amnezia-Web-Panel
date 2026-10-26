@@ -21,8 +21,10 @@ import urllib.parse
 import urllib.request
 import zipfile
 import signal
+import socket
 import struct
 import zlib
+import ipaddress
 from datetime import datetime, timedelta
 import io
 from fastapi.responses import (JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
@@ -2832,6 +2834,12 @@ async def startup():
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())
 
+    # Re-apply public-port forwards on the fleet: hand-made iptables rules do
+    # not survive reboots on their own, and only some hosts persist them.
+    asyncio.create_task(restore_public_port_forwards())
+    # ... and keep re-applying: a VPS can reboot while the panel keeps running.
+    asyncio.create_task(restore_public_port_forwards_loop())
+
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
@@ -5541,6 +5549,8 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
     Both fields are optional and empty means "as before": the server's own
     address, the instance's listen port. Useful when an instance answers on a
     second IP of the same box, behind a port forward, or under a domain name.
+    A custom public port on this same box is published automatically: REDIRECT
+    rules in iptables/ip6tables send it to the instance's listen port.
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -5559,6 +5569,8 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
             return JSONResponse({'error': str(e)}, status_code=400)
 
         record = server['protocols'][proto]
+        old_public_port = str(record.get('public_port') or '').strip()
+        listen_port = str(record.get('port') or '').strip()
         for key, value in (('public_host', host), ('public_port', port)):
             if value:
                 record[key] = value
@@ -5566,33 +5578,291 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
                 record.pop(key, None)
         save_data(data)
 
-        # Telemt composes its own tg:// links from config.toml, so for that
-        # protocol the override reaches clients only after the file on the
-        # server carries it. The record is saved either way: a box that is down
-        # right now must not lose the setting, and the next install re-applies
-        # it.
+        # The override reaches the server in two ways: telemt composes its own
+        # tg:// links from config.toml, and a custom public port on this same
+        # box needs an iptables REDIRECT to the listen port. The record is
+        # saved either way: a box that is down right now must not lose the
+        # setting, and the next save re-applies it.
         warning = ''
-        if protocol_base(proto) == 'telemt':
-            ssh = None
-            try:
+        ssh = None
+        try:
+            base = protocol_base(proto)
+            if base == 'telemt':
                 pub_host, pub_port = protocol_public_endpoint(server, proto)
                 ssh = await asyncio.to_thread(get_ssh, server)
                 await asyncio.to_thread(ssh.connect)
                 manager = get_protocol_manager(ssh, proto)
                 await asyncio.to_thread(
                     manager.set_public_endpoint, pub_host, pub_port or record.get('port', '443'))
-            except Exception as e:
-                logger.warning(f"Could not apply the public endpoint to {proto}: {e}")
-                warning = str(e)
-            finally:
-                if ssh is not None:
-                    ssh.disconnect()
+            fwd_host, _ = protocol_public_endpoint(server, proto)
+            fwd, fwd_warning = public_port_forward_commands(
+                proto, port, listen_port, old_public_port, fwd_host)
+            if fwd_warning and not warning:
+                warning = fwd_warning
+            if fwd is not None:
+                if ssh is None:
+                    ssh = await asyncio.to_thread(get_ssh, server)
+                    await asyncio.to_thread(ssh.connect)
+                for cmd in fwd:
+                    out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd)
+                    if code != 0 and not warning:
+                        logger.warning(f"Public port forward command failed on {proto}: {cmd}: {err}")
+                        warning = f"forward command failed: {cmd}: {err}"
+                # Verify the rule exists for each address family when adding,
+                # scoped exactly like the rule that was installed.
+                if not warning and port and str(port) != str(listen_port):
+                    l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
+                    if l4:
+                        fam, _ = _forward_family_dests(fwd_host)
+                        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
+                            addrs = fam[fkey]
+                            if addrs == []:
+                                continue
+                            for addr in (addrs if addrs is not None else ['']):
+                                dest = f' -d {addr}' if addr else ''
+                                verify = (f'{ipt} -t nat -C PREROUTING -p {l4}{dest} --dport {port} '
+                                          f'-j REDIRECT --to-ports {listen_port}')
+                                vout, verr, vcode = await asyncio.to_thread(ssh.run_sudo_command, verify)
+                                if vcode != 0 and not warning:
+                                    logger.warning(f"Public port forward verification failed on {proto}: {ipt}: {verr}")
+                                    warning = f"forward verification failed: {ipt} REDIRECT to :{listen_port} not present"
+        except Exception as e:
+            logger.warning(f"Could not apply the public endpoint to {proto}: {e}")
+            warning = str(e)
+        finally:
+            if ssh is not None:
+                ssh.disconnect()
 
         return {'status': 'success', 'protocol': proto,
                 'public_host': host, 'public_port': port, 'warning': warning}
     except Exception as e:
         logger.exception("Error setting protocol public endpoint")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+# Public ports are published on the box itself: UDP for the WireGuard family,
+# TCP for the rest. DNS resolvers and the exit node have nothing to publish.
+PUBLIC_FORWARD_L4 = {
+    'udp': ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard'),
+    'tcp': ('xray', 'telemt', 'socks5', 'nginx'),
+}
+
+# Seconds before the startup re-apply touches SSH, so the panel is serving
+# first. Patched to 0 in tests.
+RESTORE_FORWARD_DELAY = 10
+
+# Seconds between periodic re-applies of the public-port forwards. A VPS can
+# reboot on its own while the panel keeps running, and hand-made iptables
+# rules do not come back - the panel owns putting them back, again and again.
+# Idempotency makes every round safe: -C-guarded additions never duplicate.
+RESTORE_FORWARD_INTERVAL = 6 * 3600
+
+
+async def restore_public_port_forwards():
+    """Re-apply public-port REDIRECT rules on every server at panel startup.
+
+    Hosts have no uniform persistence for hand-made iptables rules (netfilter
+    -persistent exists on some boxes only, docker restores only its own), so
+    after a server or panel restart the panel's own forwards were gone. The
+    panel owns these rules -- it puts them back. Idempotent: additions are
+    guarded by -C, so a double run never duplicates anything.
+    """
+    await asyncio.sleep(RESTORE_FORWARD_DELAY)  # let the panel finish booting
+    data = load_data()
+    for server in data.get('servers', []):
+        commands = []
+        for proto, record in (server.get('protocols') or {}).items():
+            if not isinstance(record, dict):
+                continue
+            public_port = str(record.get('public_port') or '').strip()
+            listen_port = str(record.get('port') or '').strip()
+            if not public_port or not listen_port:
+                continue
+            pub_host, _ = protocol_public_endpoint(server, proto)
+            cmds, fwd_warning = public_port_forward_commands(
+                proto, public_port, listen_port, public_ip=pub_host)
+            if fwd_warning:
+                logger.warning(f"Public port forward on "
+                               f"{server.get('name') or server.get('host')} {proto}: {fwd_warning}")
+            if cmds:
+                commands.extend(cmds)
+        if not commands:
+            continue
+        ssh = None
+        try:
+            ssh = get_ssh(server)
+            await asyncio.to_thread(ssh.connect)
+            failed = False
+            for cmd in commands:
+                out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd)
+                if code != 0:
+                    logger.error(f"Failed to re-apply public port forward on "
+                                 f"{server.get('name') or server.get('host')}: {cmd}: {err}")
+                    failed = True
+            if not failed:
+                logger.info(f"Public port forwards re-applied on {server.get('name') or server.get('host')}")
+        except Exception as e:
+            logger.warning(f"Could not re-apply public port forwards on "
+                           f"{server.get('name') or server.get('host')}: {e}")
+        finally:
+            if ssh is not None:
+                ssh.disconnect()
+
+
+async def restore_public_port_forwards_loop():
+    """Re-apply the forwards periodically, not only at panel startup: a VPS
+    rebooted independently leaves its REDIRECT rules gone until someone
+    restarts the panel. Never raises - the next round retries."""
+    while True:
+        await asyncio.sleep(RESTORE_FORWARD_INTERVAL)
+        try:
+            await restore_public_port_forwards()
+        except Exception as e:
+            logger.warning(f"Periodic public port forward re-apply failed: {e}")
+
+
+def _forward_family_dests(public_ip):
+    """Per-address-family -d scoping for the REDIRECT rules.
+
+    Returns ({4: addrs|None, 6: addrs|None}, warning): None means the family
+    stays unrestricted, [] means the family is skipped entirely (a resolved
+    host with no addresses of that family publishes nothing there), a list
+    scopes every rule of that family to those addresses. An IP literal
+    restricts its own family only; a domain resolves on the panel machine.
+    An unresolvable domain falls back to unrestricted rules plus a warning
+    the API surfaces.
+    """
+    if not public_ip:
+        return {4: None, 6: None}, ''
+    host = str(public_ip).strip()
+    try:
+        addr = ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        addr = None
+    if addr is not None:
+        fam = {4: [], 6: []}
+        fam[addr.version] = [str(addr)]
+        return fam, ''
+    v4, v6 = [], []
+    try:
+        for info in socket.getaddrinfo(host, None):
+            if info[0] == socket.AF_INET:
+                v4.append(info[4][0])
+            elif info[0] == socket.AF_INET6:
+                v6.append(info[4][0])
+    except OSError:
+        pass
+    v4, v6 = sorted(set(v4)), sorted(set(v6))
+    if not v4 and not v6:
+        return {4: None, 6: None}, (f'could not restrict the forward rule to the public IP: '
+                                    f'{host} does not resolve')
+    return {4: v4, 6: v6}, ''
+
+
+def public_port_forward_commands(protocol, public_port, listen_port, old_public_port='',
+                                 public_ip=''):
+    """iptables/ip6tables commands publishing a custom public port.
+
+    Returns (commands, warning); commands is None when nothing is needed.
+    A public port equal to the listen port (or empty) means "no rule"; any
+    previous rule for the same instance is removed. Idempotent: additions are
+    guarded by -C, removals loop -D until the rule is gone. Rules are scoped
+    to the public address (-d public_ip) so they redirect only the traffic
+    actually meant for this instance, not every packet hitting the port.
+    """
+    base = protocol_base(protocol)
+    l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
+    if l4 is None:
+        return None, ''
+    fam, warning = _forward_family_dests(public_ip)
+    commands = []
+
+    def drop(port):
+        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
+            addrs = fam[fkey]
+            if addrs == []:
+                continue  # nothing was ever published in this family
+            for addr in (addrs if addrs is not None else ['']):
+                dest = f' -d {addr}' if addr else ''
+                rule = (f'-t nat -D PREROUTING -p {l4}{dest} --dport {port} '
+                        f'-j REDIRECT --to-ports {listen_port}')
+                commands.append(f'for i in 1 2 3; do {ipt} {rule} 2>/dev/null || break; done')
+
+    for stale in {p for p in (old_public_port,) if p and p != public_port}:
+        drop(stale)
+    if public_port and public_port != listen_port:
+        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
+            addrs = fam[fkey]
+            if addrs == []:
+                continue
+            for addr in (addrs if addrs is not None else ['']):
+                dest = f' -d {addr}' if addr else ''
+                rule = (f'-t nat -A PREROUTING -p {l4}{dest} --dport {public_port} '
+                        f'-j REDIRECT --to-ports {listen_port}')
+                commands.append(f'{ipt} {rule.replace("-A ", "-C ", 1)} 2>/dev/null || {ipt} {rule}')
+    return (commands or None), warning
+
+
+def _parse_ss_listeners(output):
+    """Turn `ss -tulpnH` output into [{proto, address, process, pid}]."""
+    listeners = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split(None, 5)
+        if len(fields) < 5 or fields[0] not in ('tcp', 'udp'):
+            continue
+        process, pid = '', ''
+        if len(fields) > 5:
+            m = re.search(r'\("([^"]+)",pid=(\d+)', fields[5])
+            if m:
+                process, pid = m.group(1), m.group(2)
+        listeners.append({'proto': fields[0], 'address': fields[4],
+                          'process': process, 'pid': pid})
+    return listeners
+
+
+@app.get('/api/servers/{server_id}/protocol/port-check', tags=["Protocols"])
+async def api_check_protocol_port(request: Request, server_id: int, port: str = ''):
+    """Who is listening on a candidate port on the server.
+
+    For the public-endpoint modal: before a custom port is published in
+    client configs the admin should see whether (and by what) it is taken.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        port = normalize_public_port(port)
+    except ValueError as e:
+        return JSONResponse({'error': str(e)}, status_code=400)
+    if not port:
+        return JSONResponse({'error': 'Port is required'}, status_code=400)
+    data = load_data()
+    if server_id >= len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = data['servers'][server_id]
+    ssh = None
+    try:
+        ssh = get_ssh(server)
+        await asyncio.to_thread(ssh.connect)
+        out, _, _ = await asyncio.to_thread(
+            ssh.run_command, "ss -tulpnH '( sport = :%d )'" % int(port))
+        listeners = _parse_ss_listeners(out)
+        resp = {'port': int(port), 'in_use': bool(listeners), 'listeners': listeners}
+        if listeners:
+            foreign = [l for l in listeners
+                       if not re.match(r'^(docker-proxy|dockerd)$', l.get('process', ''))]
+            if not foreign:
+                resp['warning'] = (f'Port {port} is held by Docker; the REDIRECT rule may '
+                                   f'conflict unless the container publish is removed.')
+        return resp
+    except Exception as e:
+        logger.warning(f"Port check on server {server_id} failed: {e}")
+        return JSONResponse({'error': str(e)}, status_code=502)
+    finally:
+        if ssh is not None:
+            ssh.disconnect()
 
 
 @app.post('/api/servers/{server_id}/wgeasy/import', tags=["Protocols"])

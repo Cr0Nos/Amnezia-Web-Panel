@@ -11,6 +11,50 @@ def read(*parts):
         return f.read()
 
 
+class PublicEndpointPortCheckTests(unittest.TestCase):
+    """The public-endpoint modal gates Save behind a port check: the checker
+    button and result element must exist, the JS must call the port-check API
+    and disable Save until a verdict, and every public_endpoint_* key must
+    exist in all locales."""
+
+    def setUp(self):
+        self.page = read('templates', 'server.html')
+
+    def test_checker_controls_present(self):
+        for el in ('publicEndpointCheckBtn', 'publicEndpointPortResult'):
+            self.assertIn(f'id="{el}"', self.page)
+        self.assertIn("onclick=\"checkPublicEndpointPort()\"", self.page)
+        self.assertIn("/protocol/port-check?port=", self.page)
+
+    def test_docker_holder_flow_warns_but_keeps_save(self):
+        # When only docker-proxy/dockerd hold the port, Save stays enabled
+        # (publicEndpointPortVerified = true) but a warning from the API is
+        # rendered in the result area with warning styling.
+        self.assertIn('data.warning', self.page)
+        self.assertIn("res.style.color = 'var(--warning, #fbbf24)'", self.page)
+        # the docker-only branch keeps verification true (Save enabled) and
+        # the text surfaces the holder list
+        idx = self.page.index('!foreign.length')
+        docker_section = self.page[idx:idx + 300]
+        self.assertIn('publicEndpointPortVerified = true', docker_section)
+        self.assertIn('warnText', docker_section)
+
+    def test_save_is_gated_by_the_check(self):
+        self.assertIn('publicEndpointPortVerified', self.page)
+        self.assertIn("btn.disabled = !!port && port !== publicEndpointSavedPort && !publicEndpointPortVerified",
+                      self.page)
+        self.assertIn("e.target.id === 'publicEndpointPort'", self.page)
+
+    def test_translations_in_all_languages(self):
+        keys = {'public_endpoint_check', 'public_endpoint_checking',
+                'public_endpoint_port_free', 'public_endpoint_port_docker',
+                'public_endpoint_port_busy', 'public_endpoint_port_invalid'}
+        for lang in ('en', 'ru', 'fr', 'fa', 'zh'):
+            data = json.loads(read('translations', f'{lang}.json'))
+            missing = sorted(k for k in keys if k not in data)
+            self.assertEqual(missing, [], f'{lang}: {missing}')
+
+
 class ExitNodeUiWiringTests(unittest.TestCase):
     """Text-level checks of the wiring that makes the exit-node UI appear at
     all (a card that is not in MARKETPLACE_APPS is never shown, an install
