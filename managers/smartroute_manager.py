@@ -599,7 +599,20 @@ class SmartRouteManager:
             raise SmartRouteError((err or f'could not push the prefix list to {container}').strip())
 
     def enable_instance(self, container, config_path, subnet_default):
-        """Marker on the host + throws + accounting inside the container."""
+        """Marker on the host + throws + accounting inside the container.
+
+        The marker is written BEFORE the apply ON PURPOSE: while it exists,
+        the hourly updater keeps pushing fresh prefix lists and re-applying
+        the throw routes in this container, so a failed enable never leaves
+        the box with a stale list, and a retry is a plain idempotent re-apply
+        of the same host/container steps.
+
+        Deliberate consequence: on a failed enable the panel records NOTHING
+        (the caller sets the smart_route flag only on success), yet the host
+        marker and the container routes may transiently diverge from the
+        panel state. That is safe and self-heals on the next successful
+        enable or disable.
+        """
         _, err, code = self.ssh.run_sudo_command(
             f'mkdir -p {SMARTR_INSTANCES} && echo {SMARTR_TABLE} > {SMARTR_INSTANCES}/{container}')
         if code != 0:
@@ -614,7 +627,9 @@ class SmartRouteManager:
         marker goes only after a successful cleanup: while it exists, the
         hourly update keeps refreshing the (still-applied) routes and a retry
         remains possible. Removing it first would strand a failed container
-        in a state nothing manages."""
+        in a state nothing manages. The same transient divergence between
+        host/container state and the panel flag is safe here and self-heals
+        on the next successful disable or enable."""
         script = render_container_script(
             CONTAINER_DISABLE_SCRIPT, config_path=config_path, subnet_default=subnet_default)
         result = self._container_run(container, script)
