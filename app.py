@@ -61,6 +61,7 @@ from mail_service import (
 )
 from pwa import build_manifest
 from captcha_challenges import captcha_challenges
+from user_state import reconcile_user_state, apply_traffic_samples, traffic_server_identity
 from connection_service import (
     ConnectionService,
     DEFAULT_SELF_SERVICE_SETTINGS,
@@ -1838,32 +1839,116 @@ def perform_delete_user(data: dict, user_id: str):
     return True
 
 
-async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
-    """Enable or disable a user and propagate the change to all their VPN connections."""
-    user = next((u for u in data['users'] if u['id'] == user_id), None)
-    if not user:
-        return False
+def _user_connection_identity(data, user_id):
+    result = []
+    for conn in data.get('user_connections', []):
+        if conn['user_id'] != user_id:
+            continue
+        sid = conn['server_id']
+        identity = traffic_server_identity(data['servers'][sid]) if 0 <= sid < len(data['servers']) else None
+        result.append((conn['id'], conn['protocol'], conn['client_id'], identity))
+    return sorted(result)
 
-    user['enabled'] = enable
 
-    user_conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
-    for uc in user_conns:
-        try:
-            sid = uc['server_id']
-            if sid >= len(data['servers']):
+async def _propagate_user_state(user_id):
+    # One worker per user, including when an HTTP waiter is cancelled. A newer
+    # committed intent is applied after any already-running SSH command.
+    for _ in range(8):
+        async with DATA_LOCK:
+            data = load_data()
+            user = next((u for u in data['users'] if u['id'] == user_id), None)
+            if user is None:
+                return False
+            revision = user.get('access_revision', 0)
+            enabled = user.get('enabled', True)
+            connections = _user_connection_identity(data, user_id)
+        failed = False
+        for connection_id, protocol, client_id, server_identity in connections:
+            ssh = None
+            try:
+                async with DATA_LOCK:
+                    current = load_data()
+                    user = next((u for u in current['users'] if u['id'] == user_id), None)
+                    if user is None:
+                        return False
+                    if user.get('access_revision', 0) != revision:
+                        break
+                    conn = next((c for c in current['user_connections'] if c['id'] == connection_id), None)
+                    if conn is None or not 0 <= conn['server_id'] < len(current['servers']):
+                        failed = True
+                        break
+                    server = current['servers'][conn['server_id']]
+                    if (traffic_server_identity(server) != server_identity or conn['client_id'] != client_id
+                            or conn['protocol'] != protocol or conn['user_id'] != user_id):
+                        failed = True
+                        break
+                ssh = await asyncio.to_thread(get_ssh, server)
+                await asyncio.to_thread(ssh.connect)
+                # Do not execute an obsolete decision after a slow connect.
+                async with DATA_LOCK:
+                    latest = load_data()
+                    user = next((u for u in latest['users'] if u['id'] == user_id), None)
+                    if user is None:
+                        return False
+                    if user.get('access_revision', 0) != revision:
+                        break
+                    if _user_connection_identity(latest, user_id) != connections:
+                        break
+                manager = get_protocol_manager(ssh, protocol)
+                clients = await asyncio.to_thread(_manager_call, manager, 'get_clients', protocol)
+                peer = next((c for c in clients if str(c.get('clientId')) == str(client_id)), None)
+                actual = peer.get('enabled', peer.get('userData', {}).get('enabled')) if peer else None
+                if not isinstance(actual, bool):
+                    raise RuntimeError('Peer state could not be verified')
+                if actual != enabled:
+                    async with DATA_LOCK:
+                        latest = load_data()
+                        user = next((u for u in latest['users'] if u['id'] == user_id), None)
+                        if user is None:
+                            return False
+                        if (user.get('access_revision', 0) != revision
+                                or _user_connection_identity(latest, user_id) != connections):
+                            break
+                    await asyncio.to_thread(_manager_call, manager, 'toggle_client', protocol, client_id, enabled)
+                    clients = await asyncio.to_thread(_manager_call, manager, 'get_clients', protocol)
+                    peer = next((c for c in clients if str(c.get('clientId')) == str(client_id)), None)
+                    if peer is None or peer.get('enabled', peer.get('userData', {}).get('enabled')) is not enabled:
+                        raise RuntimeError('Peer state was not applied')
+            except Exception:
+                failed = True
+                logger.warning("User access SSH application pending: user=%s connection=%s", user_id, connection_id)
+            finally:
+                if ssh is not None:
+                    try:
+                        await asyncio.to_thread(ssh.disconnect)
+                    except Exception:
+                        failed = True
+        async with DATA_LOCK:
+            current = load_data()
+            user = next((u for u in current['users'] if u['id'] == user_id), None)
+            if user is None:
+                return False
+            if user.get('access_revision', 0) != revision or _user_connection_identity(current, user_id) != connections:
                 continue
-            server = data['servers'][sid]
-            ssh = await asyncio.to_thread(get_ssh, server)
-            await asyncio.to_thread(ssh.connect)
-            manager = get_protocol_manager(ssh, uc['protocol'])
-            await asyncio.to_thread(
-                _manager_call, manager, 'toggle_client', uc['protocol'], uc['client_id'], enable
-            )
-            await asyncio.to_thread(ssh.disconnect)
-        except Exception as e:
-            logger.warning(f"Failed to toggle connection {uc['client_id']} during user toggle: {e}")
+            if failed:
+                return False
+            user['access_sync_pending'] = False
+            save_data(current)
+            return True
+    return False
 
-    return True
+
+async def perform_toggle_user(data: dict, user_id: str, enable: bool) -> bool:
+    # The old snapshot/enable arguments are deliberately not authoritative.
+    task = _USER_STATE_TASKS.get(user_id)
+    if task is None or task.done():
+        task = asyncio.create_task(_propagate_user_state(user_id))
+        _USER_STATE_TASKS[user_id] = task
+        def finished(done):
+            if _USER_STATE_TASKS.get(user_id) is done:
+                _USER_STATE_TASKS.pop(user_id, None)
+        task.add_done_callback(finished)
+    return await asyncio.shield(task)
 
 
 async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: List[tuple] = None, create_conns: List[dict] = None):
@@ -1871,12 +1956,22 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
     Executes multiple SSH operations efficiently.
     Reloads data inside to ensure we don't overwrite other changes.
     """
+    toggle_results = []
+    if toggle_uids:
+        async with DATA_LOCK:
+            current = load_data()
+            for uid, enabled in toggle_uids:
+                user = next((u for u in current['users'] if u['id'] == uid), None)
+                if user:
+                    reconcile_user_state(user, datetime.now(), external=enabled)
+            save_data(current)
+        toggle_results = await asyncio.gather(*(perform_toggle_user({}, uid, enabled) for uid, enabled in toggle_uids))
     data = load_data()
     server_ops = {}
 
     def get_ops(sid):
         if sid not in server_ops:
-            server_ops[sid] = {'delete': [], 'toggle': [], 'create': []}
+            server_ops[sid] = {'delete': [], 'create': []}
         return server_ops[sid]
 
     if delete_uids:
@@ -1884,11 +1979,6 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
             conns = [c for c in data.get('user_connections', []) if c['user_id'] == uid]
             for c in conns: get_ops(c['server_id'])['delete'].append(c)
     
-    if toggle_uids:
-        for uid, enabled in toggle_uids:
-            conns = [c for c in data.get('user_connections', []) if c['user_id'] == uid]
-            for c in conns: get_ops(c['server_id'])['toggle'].append((c, enabled))
-
     if create_conns:
         for req in create_conns: get_ops(req['server_id'])['create'].append(req)
 
@@ -1911,18 +2001,6 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
                 async with DATA_LOCK:
                     current_data = load_data()
                     current_data['user_connections'] = [conn for conn in current_data['user_connections'] if conn['id'] != c['id']]
-                    save_data(current_data)
-            
-            # 2. Toggles
-            for c, enabled in ops['toggle']:
-                manager = get_protocol_manager(ssh, c['protocol'])
-                await asyncio.to_thread(_manager_call, manager, 'toggle_client', c['protocol'], c['client_id'], enabled)
-                # Incremental toggle in data
-                async with DATA_LOCK:
-                    current_data = load_data()
-                    # We also need to update user status if it was a user toggle
-                    # Wait, mass ops caller usually handles user enabled status. 
-                    # Here we just toggle the actual wireguard peer.
                     save_data(current_data)
             
             # 3. Creates
@@ -1967,13 +2045,9 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
         if delete_uids:
             current_data['users'] = [u for u in current_data['users'] if u['id'] not in delete_uids]
             current_data['user_connections'] = [c for c in current_data.get('user_connections', []) if c['user_id'] not in delete_uids]
-        if toggle_uids:
-            for uid, enabled in toggle_uids:
-                user = next((u for u in current_data['users'] if u['id'] == uid), None)
-                if user: user['enabled'] = enabled
         save_data(current_data)
 
-    return True
+    return all(toggle_results)
 
 
 async def sync_users_with_remnawave(data: dict):
@@ -2057,7 +2131,8 @@ async def sync_users_with_remnawave(data: dict):
                         # Update index
                         idx = next((i for i, u in enumerate(current['users']) if u['id'] == local_u['id']), -1)
                         if idx != -1:
-                            current['users'][idx] = local_u
+                            current['users'][idx].update({key: local_u[key] for key in
+                                ('username', 'telegramId', 'email', 'description', 'remnawave_uuid')})
                             save_data(current)
                     
                     synced_count += 1
@@ -2072,6 +2147,7 @@ async def sync_users_with_remnawave(data: dict):
                         'email': rw_u.get('email'),
                         'description': rw_u.get('description'),
                         'enabled': is_active,
+                        'disable_reasons': [] if is_active else ['external'],
                         'created_at': datetime.now().isoformat(),
                         'remnawave_uuid': rw_u['uuid'],
                         'share_enabled': False,
@@ -2097,7 +2173,9 @@ async def sync_users_with_remnawave(data: dict):
             # Execute all collected mass operations
             if to_toggle or to_create_conns:
                 logger.info(f"Executing mass ops for Remnawave sync: toggle={len(to_toggle)}, create={len(to_create_conns)}")
-                await perform_mass_operations(toggle_uids=to_toggle, create_conns=to_create_conns)
+                applied = await perform_mass_operations(toggle_uids=to_toggle, create_conns=to_create_conns)
+                if not applied:
+                    return synced_count, "Metadata synchronized; access SSH application pending"
             
             return synced_count, "Successfully synchronized with Remnawave"
             
@@ -2875,6 +2953,7 @@ def _scrape_server_traffic(server, sid, my_conns):
         for proto in ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard']:
             if proto in server.get('protocols', {}):
                 manager = get_protocol_manager(ssh, proto)
+                observed_at = time.time()
                 clients = _manager_call(manager, 'get_clients', proto)
                 client_bytes = {}
                 for c in clients:
@@ -2885,13 +2964,36 @@ def _scrape_server_traffic(server, sid, my_conns):
                 for uc in my_conns:
                     if uc['protocol'] == proto and uc['client_id'] in client_bytes:
                         curr_bytes = client_bytes[uc['client_id']]
-                        last_bytes = uc.get('last_bytes', 0)
-                        delta = curr_bytes - last_bytes if curr_bytes >= last_bytes else curr_bytes
-                        server_updates.append((uc['id'], delta, curr_bytes))
+                        server_updates.append({
+                            'id': uc['id'], 'user_id': uc['user_id'],
+                            'protocol': proto, 'client_id': uc['client_id'],
+                            'server_identity': traffic_server_identity(server),
+                            'bytes': curr_bytes, 'observed_at': observed_at,
+                        })
         ssh.disconnect()
     except Exception as e:
         logger.error(f"Traffic sync err server {sid}: {e}")
     return server_updates
+
+
+async def sync_user_traffic_and_state():
+    # Serialize collection AND commit across overlapping cycles, not DATA_LOCK
+    # across SSH. Normal admin writes continue while counters are collected.
+    async with _TRAFFIC_SYNC_LOCK:
+        async with DATA_LOCK:
+            data = load_data()
+        updates = []
+        for sid, server in enumerate(data.get('servers', [])):
+            conns = [c for c in data.get('user_connections', []) if c['server_id'] == sid]
+            if conns:
+                updates.extend(await asyncio.to_thread(_scrape_server_traffic, server, sid, conns))
+        async with DATA_LOCK:
+            current = load_data()
+            apply_traffic_samples(current, updates, datetime.now())
+            pending = [u['id'] for u in current['users'] if u.get('access_sync_pending')]
+            save_data(current)
+        if pending:
+            await asyncio.gather(*(perform_toggle_user({}, uid, False) for uid in pending))
 
 
 async def periodic_background_tasks():
@@ -2903,87 +3005,7 @@ async def periodic_background_tasks():
             
             # --- 1. TRAFFIC SYNC & LIMITS ---
             logger.info("Starting background traffic sync...")
-            data = load_data()
-            
-            conns_by_server = {}
-            for uc in data.get('user_connections', []):
-                sid = uc['server_id']
-                conns_by_server.setdefault(sid, []).append(uc)
-                
-            updates = []
-            
-            for sid, server in enumerate(data.get('servers', [])):
-                if sid not in conns_by_server: continue
-                
-                # Run the blocking SSH traffic scraping in a background thread!
-                server_updates = await asyncio.to_thread(_scrape_server_traffic, server, sid, conns_by_server[sid])
-                if server_updates:
-                    updates.extend(server_updates)
-
-            to_disable_uids = []
-            if updates:
-                async with DATA_LOCK:
-                    curr_data = load_data()
-                    users_map = {u['id']: u for u in curr_data.get('users', [])}
-                    uc_list = curr_data.get('user_connections', [])
-                    uc_map = {uc['id']: uc for uc in uc_list}
-                    
-                    # Current date/time for reset checking
-                    now = datetime.now()
-                    
-                    for uc_id, delta, curr_bytes in updates:
-                        if uc_id in uc_map:
-                            uc_map[uc_id]['last_bytes'] = curr_bytes
-                            uid = uc_map[uc_id]['user_id']
-                            if uid in users_map:
-                                u = users_map[uid]
-                                # Check if reset is needed BEFORE adding new consumption
-                                strategy = u.get('traffic_reset_strategy', 'never')
-                                last_reset_iso = u.get('last_reset_at')
-                                
-                                reset_needed = False
-                                if strategy != 'never' and last_reset_iso:
-                                    try:
-                                        last = datetime.fromisoformat(last_reset_iso)
-                                        if strategy == 'daily':
-                                            reset_needed = now.date() > last.date()
-                                        elif strategy == 'weekly':
-                                            reset_needed = now.isocalendar()[1] != last.isocalendar()[1] or now.year != last.year
-                                        elif strategy == 'monthly':
-                                            reset_needed = now.month != last.month or now.year != last.year
-                                    except:
-                                        pass
-                                
-                                if reset_needed:
-                                    logger.info(f"Resetting traffic for user {u['username']} (strategy: {strategy})")
-                                    u['traffic_used'] = 0
-                                    u['last_reset_at'] = now.isoformat()
-                                
-                                # Update both resettable and total traffic
-                                u['traffic_used'] = u.get('traffic_used', 0) + delta
-                                u['traffic_total'] = u.get('traffic_total', 0) + delta
-                                
-                                limit = u.get('traffic_limit', 0)
-                                if limit > 0 and u['traffic_used'] >= limit and u.get('enabled', True):
-                                    if uid not in to_disable_uids:
-                                        to_disable_uids.append(uid)
-                                
-                                # Check expiration date
-                                exp_str = u.get('expiration_date')
-                                if exp_str and u.get('enabled', True):
-                                    try:
-                                        exp_date = datetime.fromisoformat(exp_str)
-                                        if now > exp_date:
-                                            logger.info(f"Subscription expired for user {u['username']} (expired at {exp_str})")
-                                            if uid not in to_disable_uids:
-                                                to_disable_uids.append(uid)
-                                    except:
-                                        pass
-                    save_data(curr_data)
-                    
-            if to_disable_uids:
-                logger.info(f"Traffic limit reached, disabling users: {to_disable_uids}")
-                await perform_mass_operations(toggle_uids=[(uid, False) for uid in to_disable_uids])
+            await sync_user_traffic_and_state()
 
             # --- 2. AUTO BACKUP ---
             await run_auto_backups_if_due()
@@ -6125,6 +6147,9 @@ def api_list_users(request: Request, search: str = '', page: int = 1, size: int 
         users.append({
             'id': u['id'], 'username': u['username'], 'role': u['role'],
             'enabled': u.get('enabled', True),
+            'disable_reasons': u.get('disable_reasons', [] if u.get('enabled', True) else ['legacy']),
+            'access_revision': u.get('access_revision', 0),
+            'access_sync_pending': u.get('access_sync_pending', False),
             'created_at': u.get('created_at', ''),
             'telegramId': u.get('telegramId'),
             'email': u.get('email'),
@@ -6284,21 +6309,16 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
             if req.password:
                 user['password_hash'] = hash_password(req.password)
 
-            # Persist the complete local intent before SSH can yield. Never write
-            # this snapshot again after SSH: traffic accounting and other requests
-            # may have saved newer fields while the network operation was pending.
-            auto_reenable = (
-                req.traffic_limit is not None
-                and new_limit > 0
-                and user.get('traffic_used', 0) < new_limit
-                and not user.get('enabled', True)
-            )
-            if auto_reenable:
-                user['enabled'] = True
+            old_enabled = user.get('enabled', True)
+            if (req.traffic_limit is not None or req.traffic_reset_strategy is not None
+                    or 'expiration_date' in req_fields):
+                reconcile_user_state(user, datetime.now())
+            pending = user.get('access_sync_pending', False)
+            wait_for_ssh = pending and (old_enabled != user['enabled'] or user_id not in _USER_STATE_TASKS)
             save_data(data)
 
-        if auto_reenable:
-            await perform_toggle_user(data, user_id, True)
+        if wait_for_ssh and not await perform_toggle_user(data, user_id, user['enabled']):
+            return JSONResponse({'error': 'Access intent saved; SSH application pending'}, status_code=503)
 
         return {'status': 'success'}
     except Exception as e:
@@ -6337,30 +6357,36 @@ async def api_toggle_user(request: Request, user_id: str, req: ToggleUserRequest
             user = next((u for u in data['users'] if u['id'] == user_id), None)
             if not user:
                 return JSONResponse({'error': 'User not found'}, status_code=404)
-            user['enabled'] = req.enabled
+            reconcile_user_state(user, datetime.now(), manual=req.enabled)
             save_data(data)
         # SSH only propagates the committed intent; it must not save an old
         # full-data snapshot when it completes.
-        await perform_toggle_user(data, user_id, req.enabled)
-        return {'status': 'success', 'enabled': req.enabled}
+        if not await perform_toggle_user(data, user_id, user['enabled']):
+            return JSONResponse({'error': 'Access intent saved; SSH application pending'}, status_code=503)
+        current = load_data()
+        user = next((u for u in current['users'] if u['id'] == user_id), None)
+        return {'status': 'success', 'enabled': user['enabled'] if user else False}
     except Exception as e:
         logger.exception("Error toggling user")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.post('/api/users/{user_id}/traffic/reset', tags=["Users"])
-def api_reset_user_traffic(request: Request, user_id: str):
+async def api_reset_user_traffic(request: Request, user_id: str):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        data = load_data()
-        user = next((u for u in data.get('users', []) if u.get('id') == user_id), None)
-        if not user:
-            return JSONResponse({'error': 'User not found'}, status_code=404)
-
-        user['traffic_used'] = 0
-        user['last_reset_at'] = datetime.now().isoformat()
-        save_data(data)
+        async with DATA_LOCK:
+            data = load_data()
+            user = next((u for u in data.get('users', []) if u.get('id') == user_id), None)
+            if not user:
+                return JSONResponse({'error': 'User not found'}, status_code=404)
+            user['traffic_used'] = 0
+            user['last_reset_at'] = datetime.now().isoformat()
+            reconcile_user_state(user, datetime.now())
+            save_data(data)
+        if user.get('access_sync_pending') and not await perform_toggle_user(data, user_id, user['enabled']):
+            return JSONResponse({'error': 'Traffic reset saved; SSH application pending'}, status_code=503)
         return {
             'status': 'success',
             'traffic_used': user['traffic_used'],
