@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import tempfile
 import unittest
 import asyncio
@@ -460,47 +461,129 @@ class PublicPortForwardTests(PublicEndpointApiTests):
         return ssh
 
     def test_command_builder_publishes_udp_for_wireguard_family(self):
-        cmds = panel.public_port_forward_commands('awg3', '8443', '55425')
+        cmds, warning = panel.public_port_forward_commands('awg3', '8443', '55425')
+        self.assertEqual(warning, '')
         self.assertEqual(len(cmds), 2)
         for ipt in ('iptables', 'ip6tables'):
             self.assertTrue(any(c.startswith(f'{ipt} -t nat -C PREROUTING -p udp --dport 8443') for c in cmds), cmds)
 
     def test_command_builder_uses_tcp_for_xray_and_skips_services(self):
-        tcp = panel.public_port_forward_commands('xray', '8443', '443')
+        tcp, _ = panel.public_port_forward_commands('xray', '8443', '443')
         self.assertTrue(all('-p tcp' in c for c in tcp))
-        self.assertIsNone(panel.public_port_forward_commands('dns', '8443', '53'))
+        self.assertIsNone(panel.public_port_forward_commands('dns', '8443', '53')[0])
 
     def test_same_or_empty_port_means_no_rule_but_clears_the_stale_one(self):
-        self.assertIsNone(panel.public_port_forward_commands('awg3', '', '55425', ''))
-        same = panel.public_port_forward_commands('awg3', '55425', '55425', '55425')
+        self.assertIsNone(panel.public_port_forward_commands('awg3', '', '55425', '')[0])
+        same, _ = panel.public_port_forward_commands('awg3', '55425', '55425', '55425')
         self.assertIsNone(same)
-        cleared = panel.public_port_forward_commands('awg3', '', '55425', '8443')
+        cleared, _ = panel.public_port_forward_commands('awg3', '', '55425', '8443')
         self.assertEqual(len(cleared), 2)
         self.assertTrue(all('-D PREROUTING' in c and '--dport 8443' in c for c in cleared), cleared)
-        changed = panel.public_port_forward_commands('awg3', '9443', '55425', '8443')
+        changed, _ = panel.public_port_forward_commands('awg3', '9443', '55425', '8443')
         self.assertTrue(any('-D PREROUTING' in c and '--dport 8443' in c for c in changed), changed)
         self.assertTrue(any('-A PREROUTING' in c and '--dport 9443' in c for c in changed), changed)
 
-    def test_saving_a_custom_port_installs_both_families(self):
+    def test_rules_are_scoped_to_a_v4_public_ip(self):
+        cmds, warning = panel.public_port_forward_commands(
+            'awg3', '8443', '55425', public_ip='203.0.113.9')
+        self.assertEqual(warning, '')
+        self.assertEqual(len(cmds), 1)  # the v6 family is not this host's
+        self.assertIn('iptables -t nat -C PREROUTING -p udp -d 203.0.113.9 --dport 8443', cmds[0])
+        dropped, _ = panel.public_port_forward_commands(
+            'awg3', '', '55425', '8443', public_ip='203.0.113.9')
+        self.assertEqual(len(dropped), 1)
+        self.assertIn('-D PREROUTING -p udp -d 203.0.113.9 --dport 8443', dropped[0])
+
+    def test_rules_are_scoped_to_a_v6_public_ip(self):
+        cmds, _ = panel.public_port_forward_commands(
+            'awg3', '8443', '55425', public_ip='[2001:db8::9]')
+        self.assertEqual(len(cmds), 1)
+        self.assertTrue(cmds[0].startswith('ip6tables -t nat -C PREROUTING -p udp '
+                                          '-d 2001:db8::9 --dport 8443'), cmds)
+
+    def test_a_domain_resolves_into_per_family_scopes(self):
+        def fake_getaddrinfo(host, port):
+            self.assertEqual(host, 'vpn.example.com')
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('203.0.113.9', 0)),
+                    (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::9', 0, 0, 0))]
+        with mock.patch.object(panel.socket, 'getaddrinfo', side_effect=fake_getaddrinfo):
+            cmds, warning = panel.public_port_forward_commands(
+                'awg3', '8443', '55425', public_ip='vpn.example.com')
+        self.assertEqual(warning, '')
+        self.assertEqual(len(cmds), 2)
+        self.assertTrue(any('-d 203.0.113.9 --dport 8443' in c and c.startswith('iptables') for c in cmds), cmds)
+        self.assertTrue(any('-d 2001:db8::9 --dport 8443' in c and c.startswith('ip6tables') for c in cmds), cmds)
+
+    def test_an_unresolvable_domain_falls_back_unrestricted_with_warning(self):
+        with mock.patch.object(panel.socket, 'getaddrinfo',
+                               side_effect=OSError('Name or service not known')):
+            cmds, warning = panel.public_port_forward_commands(
+                'awg3', '8443', '55425', public_ip='vpn.example.com')
+        self.assertEqual(len(cmds), 2)  # legacy shape: both families, no -d
+        self.assertTrue(all(' -d ' not in c for c in cmds), cmds)
+        self.assertIn('could not restrict the forward rule to the public IP', warning)
+        self.assertIn('vpn.example.com does not resolve', warning)
+
+    def test_saving_a_custom_port_scopes_the_rule_to_the_public_ip(self):
         client = self.client()
         ssh = self.ssh_recorder()
         with mock.patch.object(panel, 'get_ssh', return_value=ssh):
+            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
+                                    public_port='8443')
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertEqual(res.json()['warning'], '')
+        # 1 forward (add) + 1 verification (-C), the v4 family only - the
+        # public IP is an IPv4 literal, ip6tables has no business there
+        self.assertEqual(len(ssh.commands), 2)
+        for cmd in ssh.commands:
+            self.assertIn('iptables -t nat', cmd)
+            self.assertIn('-p udp -d 203.0.113.9 --dport 8443', cmd)
+            self.assertIn('--to-ports 55424', cmd)
+        self.assertFalse(any(c.startswith('ip6tables') for c in ssh.commands))
+
+    def test_saving_a_domain_scopes_each_family_to_its_address(self):
+        client = self.client()
+        ssh = self.ssh_recorder()
+
+        def fake_getaddrinfo(host, port):
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', ('203.0.113.9', 0)),
+                    (socket.AF_INET6, socket.SOCK_STREAM, 6, '', ('2001:db8::9', 0, 0, 0))]
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh), \
+             mock.patch.object(panel.socket, 'getaddrinfo', side_effect=fake_getaddrinfo):
             res = self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
                                     public_port='8443')
         self.assertEqual(res.status_code, 200, res.text)
         self.assertEqual(res.json()['warning'], '')
-        # 2 forward (add) + 2 verification (-C) commands, one per address family
-        self.assertEqual(len(ssh.commands), 4)
-        for ipt in ('iptables', 'ip6tables'):
-            self.assertTrue(any(c.startswith(f'{ipt} -t nat -C PREROUTING -p udp --dport 8443')
-                                and '--to-ports 55424' in c for c in ssh.commands), ssh.commands)
+        v4 = [c for c in ssh.commands if c.startswith('iptables')]
+        v6 = [c for c in ssh.commands if c.startswith('ip6tables')]
+        self.assertEqual(len(v4), 2)  # add + verify
+        self.assertEqual(len(v6), 2)
+        self.assertTrue(all('-d 203.0.113.9 --dport 8443' in c for c in v4), v4)
+        self.assertTrue(all('-d 2001:db8::9 --dport 8443' in c for c in v6), v6)
+
+    def test_an_unresolvable_domain_warns_and_leaves_the_rule_unrestricted(self):
+        client = self.client()
+        ssh = self.ssh_recorder()
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh), \
+             mock.patch.object(panel.socket, 'getaddrinfo',
+                               side_effect=OSError('Name or service not known')):
+            res = self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
+                                    public_port='8443')
+        self.assertEqual(res.status_code, 200, res.text)
+        self.assertIn('could not restrict the forward rule to the public IP',
+                      res.json()['warning'])
+        self.assertIn('vpn.example.com does not resolve', res.json()['warning'])
+        # fallback shape: both families, no -d restriction; verification is
+        # skipped when a warning already exists
+        self.assertEqual(len(ssh.commands), 2)
+        self.assertTrue(all(' -d ' not in c for c in ssh.commands), ssh.commands)
 
     def test_iptables_failure_warns_but_keeps_setting(self):
         client = self.client()
         ssh = mock.Mock()
         ssh.run_sudo_command.return_value = ('', 'Permission denied', 1)
         with mock.patch.object(panel, 'get_ssh', return_value=ssh):
-            res = self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
+            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                                     public_port='8443')
         self.assertEqual(res.status_code, 200, res.text)
         body = res.json()
@@ -512,19 +595,20 @@ class PublicPortForwardTests(PublicEndpointApiTests):
         client = self.client()
         ssh = self.ssh_recorder()
         with mock.patch.object(panel, 'get_ssh', return_value=ssh):
-            self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
+            self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                               public_port='8443')
             ssh.commands.clear()
-            res = self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
+            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                                     public_port='')
         self.assertEqual(res.status_code, 200, res.text)
-        self.assertEqual(len(ssh.commands), 2)
-        self.assertTrue(all('-D PREROUTING' in c for c in ssh.commands), ssh.commands)
+        self.assertEqual(len(ssh.commands), 1)  # v4 drop only, scoped like the add
+        self.assertIn('-D PREROUTING', ssh.commands[0])
+        self.assertIn('-d 203.0.113.9 --dport 8443', ssh.commands[0])
 
     def test_a_box_that_is_down_keeps_the_setting_and_warns(self):
         client = self.client()
         with mock.patch.object(panel, 'get_ssh', side_effect=RuntimeError('host is down')):
-            res = self.set_endpoint(client, protocol='awg2', public_host='vpn.example.com',
+            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9',
                                     public_port='8443')
         self.assertEqual(res.status_code, 200, res.text)
         self.assertIn('host is down', res.json()['warning'])
@@ -545,7 +629,7 @@ class RestoreForwardTests(unittest.TestCase):
             json.dump({'servers': [
                 server_with({
                     'awg2': {'installed': True, 'port': '55424',
-                             'public_host': 'vpn.example.com', 'public_port': '8443'},
+                             'public_host': '203.0.113.9', 'public_port': '8443'},
                     'xray': {'installed': True, 'port': '443', 'public_port': '8443'},
                     'wireguard': {'installed': True, 'port': '51820'},  # no public port
                 }),
@@ -580,10 +664,41 @@ class RestoreForwardTests(unittest.TestCase):
         seen = self.run_restore()
         self.assertEqual(len(seen), 1)
         server, ssh = seen[0]
-        self.assertEqual(len(ssh.commands), 4)  # awg2 udp + xray tcp, two tables each
-        self.assertTrue(any('-p udp' in c and '--dport 8443' in c for c in ssh.commands), ssh.commands)
-        self.assertTrue(any('-p tcp' in c and '--dport 8443' in c for c in ssh.commands), ssh.commands)
+        # awg2 udp + xray tcp, the v4 table each. awg2 carries its own
+        # public_host; xray has none, so its rule is scoped to the panel's
+        # own address for that server (protocol_public_endpoint fallback)
+        self.assertEqual(len(ssh.commands), 2)
+        self.assertTrue(any('-p udp -d 203.0.113.9 --dport 8443' in c for c in ssh.commands), ssh.commands)
+        self.assertTrue(any('-p tcp -d 198.51.100.1 --dport 8443' in c for c in ssh.commands), ssh.commands)
         self.assertFalse(any('--dport 51820' in c for c in ssh.commands))
+
+    def test_periodic_loop_reapplies_forwards(self):
+        # a VPS rebooting on its own loses the rules while the panel keeps
+        # running - the loop re-applies them every RESTORE_FORWARD_INTERVAL
+        calls = []
+        real_restore = panel.restore_public_port_forwards
+        real_interval = panel.RESTORE_FORWARD_INTERVAL
+
+        async def fake_restore():
+            calls.append(1)
+
+        panel.restore_public_port_forwards = fake_restore
+        panel.RESTORE_FORWARD_INTERVAL = 0
+        try:
+            async def runner():
+                task = asyncio.create_task(panel.restore_public_port_forwards_loop())
+                for _ in range(100):
+                    await asyncio.sleep(0.001)
+                    if len(calls) >= 2:
+                        break
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            asyncio.run(runner())
+        finally:
+            panel.restore_public_port_forwards = real_restore
+            panel.RESTORE_FORWARD_INTERVAL = real_interval
+        self.assertGreaterEqual(len(calls), 2)
 
     def test_restore_forward_logs_failed_command(self):
         panel.RESTORE_FORWARD_DELAY = 0
