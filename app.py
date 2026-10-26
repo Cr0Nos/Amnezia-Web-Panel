@@ -21,8 +21,10 @@ import urllib.parse
 import urllib.request
 import zipfile
 import signal
+import socket
 import struct
 import zlib
+import ipaddress
 from datetime import datetime, timedelta
 import io
 from fastapi.responses import (JSONResponse, RedirectResponse, HTMLResponse, StreamingResponse,
@@ -2720,6 +2722,8 @@ async def startup():
     # Re-apply public-port forwards on the fleet: hand-made iptables rules do
     # not survive reboots on their own, and only some hosts persist them.
     asyncio.create_task(restore_public_port_forwards())
+    # ... and keep re-applying: a VPS can reboot while the panel keeps running.
+    asyncio.create_task(restore_public_port_forwards_loop())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -5272,7 +5276,11 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
                 manager = get_protocol_manager(ssh, proto)
                 await asyncio.to_thread(
                     manager.set_public_endpoint, pub_host, pub_port or record.get('port', '443'))
-            fwd = public_port_forward_commands(proto, port, listen_port, old_public_port)
+            fwd_host, _ = protocol_public_endpoint(server, proto)
+            fwd, fwd_warning = public_port_forward_commands(
+                proto, port, listen_port, old_public_port, fwd_host)
+            if fwd_warning and not warning:
+                warning = fwd_warning
             if fwd is not None:
                 if ssh is None:
                     ssh = await asyncio.to_thread(get_ssh, server)
@@ -5282,17 +5290,24 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
                     if code != 0 and not warning:
                         logger.warning(f"Public port forward command failed on {proto}: {cmd}: {err}")
                         warning = f"forward command failed: {cmd}: {err}"
-                # Verify the rule exists for each address family when adding.
+                # Verify the rule exists for each address family when adding,
+                # scoped exactly like the rule that was installed.
                 if not warning and port and str(port) != str(listen_port):
                     l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
                     if l4:
-                        for ipt in ('iptables', 'ip6tables'):
-                            verify = (f'{ipt} -t nat -C PREROUTING -p {l4} --dport {port} '
-                                      f'-j REDIRECT --to-ports {listen_port}')
-                            vout, verr, vcode = await asyncio.to_thread(ssh.run_sudo_command, verify)
-                            if vcode != 0 and not warning:
-                                logger.warning(f"Public port forward verification failed on {proto}: {ipt}: {verr}")
-                                warning = f"forward verification failed: {ipt} REDIRECT to :{listen_port} not present"
+                        fam, _ = _forward_family_dests(fwd_host)
+                        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
+                            addrs = fam[fkey]
+                            if addrs == []:
+                                continue
+                            for addr in (addrs if addrs is not None else ['']):
+                                dest = f' -d {addr}' if addr else ''
+                                verify = (f'{ipt} -t nat -C PREROUTING -p {l4}{dest} --dport {port} '
+                                          f'-j REDIRECT --to-ports {listen_port}')
+                                vout, verr, vcode = await asyncio.to_thread(ssh.run_sudo_command, verify)
+                                if vcode != 0 and not warning:
+                                    logger.warning(f"Public port forward verification failed on {proto}: {ipt}: {verr}")
+                                    warning = f"forward verification failed: {ipt} REDIRECT to :{listen_port} not present"
         except Exception as e:
             logger.warning(f"Could not apply the public endpoint to {proto}: {e}")
             warning = str(e)
@@ -5318,6 +5333,12 @@ PUBLIC_FORWARD_L4 = {
 # first. Patched to 0 in tests.
 RESTORE_FORWARD_DELAY = 10
 
+# Seconds between periodic re-applies of the public-port forwards. A VPS can
+# reboot on its own while the panel keeps running, and hand-made iptables
+# rules do not come back - the panel owns putting them back, again and again.
+# Idempotency makes every round safe: -C-guarded additions never duplicate.
+RESTORE_FORWARD_INTERVAL = 6 * 3600
+
 
 async def restore_public_port_forwards():
     """Re-apply public-port REDIRECT rules on every server at panel startup.
@@ -5339,7 +5360,12 @@ async def restore_public_port_forwards():
             listen_port = str(record.get('port') or '').strip()
             if not public_port or not listen_port:
                 continue
-            cmds = public_port_forward_commands(proto, public_port, listen_port)
+            pub_host, _ = protocol_public_endpoint(server, proto)
+            cmds, fwd_warning = public_port_forward_commands(
+                proto, public_port, listen_port, public_ip=pub_host)
+            if fwd_warning:
+                logger.warning(f"Public port forward on "
+                               f"{server.get('name') or server.get('host')} {proto}: {fwd_warning}")
             if cmds:
                 commands.extend(cmds)
         if not commands:
@@ -5365,33 +5391,98 @@ async def restore_public_port_forwards():
                 ssh.disconnect()
 
 
-def public_port_forward_commands(protocol, public_port, listen_port, old_public_port=''):
-    """iptables/ip6tables commands publishing a custom public port, or None.
+async def restore_public_port_forwards_loop():
+    """Re-apply the forwards periodically, not only at panel startup: a VPS
+    rebooted independently leaves its REDIRECT rules gone until someone
+    restarts the panel. Never raises - the next round retries."""
+    while True:
+        await asyncio.sleep(RESTORE_FORWARD_INTERVAL)
+        try:
+            await restore_public_port_forwards()
+        except Exception as e:
+            logger.warning(f"Periodic public port forward re-apply failed: {e}")
 
+
+def _forward_family_dests(public_ip):
+    """Per-address-family -d scoping for the REDIRECT rules.
+
+    Returns ({4: addrs|None, 6: addrs|None}, warning): None means the family
+    stays unrestricted, [] means the family is skipped entirely (a resolved
+    host with no addresses of that family publishes nothing there), a list
+    scopes every rule of that family to those addresses. An IP literal
+    restricts its own family only; a domain resolves on the panel machine.
+    An unresolvable domain falls back to unrestricted rules plus a warning
+    the API surfaces.
+    """
+    if not public_ip:
+        return {4: None, 6: None}, ''
+    host = str(public_ip).strip()
+    try:
+        addr = ipaddress.ip_address(host.strip('[]'))
+    except ValueError:
+        addr = None
+    if addr is not None:
+        fam = {4: [], 6: []}
+        fam[addr.version] = [str(addr)]
+        return fam, ''
+    v4, v6 = [], []
+    try:
+        for info in socket.getaddrinfo(host, None):
+            if info[0] == socket.AF_INET:
+                v4.append(info[4][0])
+            elif info[0] == socket.AF_INET6:
+                v6.append(info[4][0])
+    except OSError:
+        pass
+    v4, v6 = sorted(set(v4)), sorted(set(v6))
+    if not v4 and not v6:
+        return {4: None, 6: None}, (f'could not restrict the forward rule to the public IP: '
+                                    f'{host} does not resolve')
+    return {4: v4, 6: v6}, ''
+
+
+def public_port_forward_commands(protocol, public_port, listen_port, old_public_port='',
+                                 public_ip=''):
+    """iptables/ip6tables commands publishing a custom public port.
+
+    Returns (commands, warning); commands is None when nothing is needed.
     A public port equal to the listen port (or empty) means "no rule"; any
     previous rule for the same instance is removed. Idempotent: additions are
-    guarded by -C, removals loop -D until the rule is gone.
+    guarded by -C, removals loop -D until the rule is gone. Rules are scoped
+    to the public address (-d public_ip) so they redirect only the traffic
+    actually meant for this instance, not every packet hitting the port.
     """
     base = protocol_base(protocol)
     l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
     if l4 is None:
-        return None
+        return None, ''
+    fam, warning = _forward_family_dests(public_ip)
     commands = []
 
     def drop(port):
-        for ipt in ('iptables', 'ip6tables'):
-            rule = (f'-t nat -D PREROUTING -p {l4} --dport {port} '
-                    f'-j REDIRECT --to-ports {listen_port}')
-            commands.append(f'for i in 1 2 3; do {ipt} {rule} 2>/dev/null || break; done')
+        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
+            addrs = fam[fkey]
+            if addrs == []:
+                continue  # nothing was ever published in this family
+            for addr in (addrs if addrs is not None else ['']):
+                dest = f' -d {addr}' if addr else ''
+                rule = (f'-t nat -D PREROUTING -p {l4}{dest} --dport {port} '
+                        f'-j REDIRECT --to-ports {listen_port}')
+                commands.append(f'for i in 1 2 3; do {ipt} {rule} 2>/dev/null || break; done')
 
     for stale in {p for p in (old_public_port,) if p and p != public_port}:
         drop(stale)
     if public_port and public_port != listen_port:
-        for ipt in ('iptables', 'ip6tables'):
-            rule = (f'-t nat -A PREROUTING -p {l4} --dport {public_port} '
-                    f'-j REDIRECT --to-ports {listen_port}')
-            commands.append(f'{ipt} {rule.replace("-A ", "-C ", 1)} 2>/dev/null || {ipt} {rule}')
-    return commands or None
+        for ipt, fkey in (('iptables', 4), ('ip6tables', 6)):
+            addrs = fam[fkey]
+            if addrs == []:
+                continue
+            for addr in (addrs if addrs is not None else ['']):
+                dest = f' -d {addr}' if addr else ''
+                rule = (f'-t nat -A PREROUTING -p {l4}{dest} --dport {public_port} '
+                        f'-j REDIRECT --to-ports {listen_port}')
+                commands.append(f'{ipt} {rule.replace("-A ", "-C ", 1)} 2>/dev/null || {ipt} {rule}')
+    return (commands or None), warning
 
 
 def _parse_ss_listeners(output):
