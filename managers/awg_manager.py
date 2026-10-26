@@ -3407,9 +3407,65 @@ PersistentKeepalive = 25
             self._invalidate_config_cache(protocol_type)
 
         # Sync config
-        self.ssh.run_sudo_command(
+        _, sync_err, sync_code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
         )
+        if sync_code != 0:
+            # A failed sync with an already-updated clients table is exactly
+            # how a peer ends up half-toggled (working in wg but shown off, or
+            # vice versa) — refuse to persist the new state instead.
+            raise RuntimeError(
+                f"syncconf failed for {container_name} (exit {sync_code}): "
+                f"{sync_err or 'no output'}. The clients table was NOT updated; "
+                f"retry the toggle.")
+
+        # Verify the toggle actually landed before persisting enabled=... .
+        # Read the config DIRECTLY from the container — not via
+        # _get_server_config, which may consume a freshly prefetched batch
+        # (built a request-moment ago) and misjudge the peer's presence.
+        # Rapid successive toggles (two requests racing the same config file)
+        # can make the first read-back see a pre-write state: retry a couple
+        # of times on a presence mismatch before raising.
+        self._invalidate_config_cache(protocol_type)
+        peer_present = None
+        for attempt in range(3):
+            applied_config, _, vcode = self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} cat {config_path}")
+            if vcode != 0 or not (applied_config or '').strip():
+                # Unreadable config must not be mistaken for a successful toggle.
+                if attempt == 2:
+                    raise RuntimeError(
+                        f"Could not read back {container_name} config after syncconf "
+                        f"— NOT updating the clients table (verification impossible).")
+                time.sleep(0.6)
+                continue
+            peer_present = client_id in applied_config
+            if peer_present == enable:
+                break
+            if attempt < 2:
+                time.sleep(0.6)
+        if enable and not peer_present:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is absent from {container_name} "
+                f"config right after enable — NOT updating the clients table "
+                f"(the enable did not land). Investigate the container state.")
+        if not enable and peer_present:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still present in "
+                f"{container_name} config right after disable — NOT marking "
+                f"it disabled in the clients table (a half-applied disable "
+                f"once left a working peer shown as off and un-re-enablable).")
+
+        # The file check above proves the config landed; the live interface
+        # is what clients actually talk to — verify the kernel state too
+        # before persisting (thanks Cr0Nos for flagging the gap).
+        if not self._verify_peer_on_interface(
+                container_name, wg_bin, iface, client_id, enable):
+            raise RuntimeError(
+                f"Interface {iface} in {container_name} does not reflect the "
+                f"requested {'enable' if enable else 'disable'} for peer "
+                f"{client_id[:12]}... — NOT updating the clients table "
+                f"(config file and running interface disagree).")
 
         # Update enabled status in clients table
         for c in clients_table:
@@ -3452,9 +3508,36 @@ PersistentKeepalive = 25
         self._invalidate_config_cache(protocol_type)
 
         # Sync config
-        self.ssh.run_sudo_command(
+        _, rm_err, rm_code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
         )
+        if rm_code != 0:
+            raise RuntimeError(
+                f"syncconf failed for {container_name} (exit {rm_code}): "
+                f"{rm_err or 'no output'}. The clients table was NOT updated.")
+
+        # Read back directly from the container (no cache) and require the
+        # peer to be gone before dropping it from the clients table.
+        self._invalidate_config_cache(protocol_type)
+        applied_config, _, vcode = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {config_path}")
+        if vcode != 0 or not (applied_config or '').strip():
+            raise RuntimeError(
+                f"Could not read back {container_name} config after removal "
+                f"— NOT dropping the peer from the clients table "
+                f"(verification impossible).")
+        if client_id in applied_config:
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still present in {container_name} "
+                f"config after removal — NOT dropping it from the clients table "
+                f"(removal did not land).")
+        # File is clean; make sure the kernel actually dropped the peer too.
+        if not self._verify_peer_on_interface(
+                container_name, wg_bin, iface, client_id, False):
+            raise RuntimeError(
+                f"Peer {client_id[:12]}... is still live on interface {iface} "
+                f"in {container_name} after removal — NOT dropping it from the "
+                f"clients table (running interface still serves the peer).")
 
         # Update clients table
         clients_table = self._get_clients_table(protocol_type)
@@ -3462,6 +3545,28 @@ PersistentKeepalive = 25
         self._save_clients_table(protocol_type, clients_table)
 
         return True
+
+    def _verify_peer_on_interface(self, container_name, wg_bin, iface,
+                                  client_id, should_be_present):
+        """Confirm via the LIVE interface (`wg show`) that the peer is in the
+        kernel state we just synced.
+
+        The config-file read-back only proves the file landed; the running
+        interface is what clients actually talk to, and the two can disagree
+        (stale file, failed reload, mid-race overwrite). Checking both keeps
+        a verified file from masking a kernel state that never updated.
+        Same race window as the file read-back, so retry before giving up.
+        """
+        for attempt in range(3):
+            show_out, _, scode = self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} {wg_bin} show {iface}")
+            if scode == 0:
+                peer_present = client_id in (show_out or '')
+                if peer_present == should_be_present:
+                    return True
+            if attempt < 2:
+                time.sleep(0.6)
+        return False
 
     def _default_dns(self):
         """Fallback DNS pair: the AmneziaDNS container when it is installed,
