@@ -6760,24 +6760,30 @@ class UnlinkConnectionRequest(BaseModel):
 
 @app.post('/api/users/{user_id}/connections/unlink', tags=["Users"])
 async def api_unlink_user_connection(request: Request, user_id: str, req: UnlinkConnectionRequest):
-    """Detach a connection from the user WITHOUT touching the peer on the
-    server: the key keeps working and the peer goes back to the pool of
-    linkable existing clients."""
+    """Retain the accounting owner until a peer can be safely finalized.
+
+    An SSH read before unlink is not a final counter: the peer may continue
+    transferring, and a periodic scrape already in flight may still need this
+    connection's baseline. A disabled user flag is not proof of remote quiescence.
+    """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    data = load_data()
-    before = len(data.get('user_connections', []))
-    data['user_connections'] = [
-        c for c in data.get('user_connections', [])
-        if not (c.get('user_id') == user_id
-                and c.get('server_id') == req.server_id
-                and c.get('protocol') == req.protocol
-                and c.get('client_id') == req.client_id)
-    ]
-    if len(data['user_connections']) == before:
-        return JSONResponse({'error': 'Connection link not found'}, status_code=404)
-    save_data(data)
-    return {'status': 'success'}
+    async with DATA_LOCK:
+        data = load_data()
+        connection = next((c for c in data.get('user_connections', [])
+                           if c.get('user_id') == user_id
+                           and c.get('server_id') == req.server_id
+                           and c.get('protocol') == req.protocol
+                           and c.get('client_id') == req.client_id), None)
+        if connection is None:
+            return JSONResponse({'error': 'Connection link not found'}, status_code=404)
+        # The current managers provide no quiesced, durable final counter
+        # receipt. Do not turn a working peer into unaccounted access, even
+        # when its owner's quota is unlimited or a local flag says disabled.
+        return JSONResponse({
+            'error': 'Peer traffic must be finalized before unlinking',
+            'code': 'traffic_finalization_required',
+        }, status_code=409)
 
 
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
