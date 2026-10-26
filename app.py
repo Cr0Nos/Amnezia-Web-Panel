@@ -51,6 +51,7 @@ from managers.backup_manager import BackupManager
 import telegram_bot as tg_bot
 
 from exit_link_service import ExitLinkError, ExitLinkService
+from smartroute_service import SmartRouteError, SmartRouteService
 from mail_service import (
     DEFAULT_MAIL_SETTINGS,
     MailError,
@@ -260,8 +261,8 @@ load_translations()
 
 # Global lock for data.json access to prevent race conditions during async operations
 DATA_LOCK = asyncio.Lock()
-_USER_STATE_TASKS = {}
-_TRAFFIC_SYNC_LOCK = asyncio.Lock()
+# Inventory/identity operations may await SSH; unrelated JSON updates stay free.
+SERVER_MUTATION_LOCK = asyncio.Lock()
 
 
 def load_data():
@@ -1720,6 +1721,17 @@ exit_link_svc = ExitLinkService(
     find_server_by_uid=find_server_by_uid,
 )
 
+smartroute_svc = SmartRouteService(
+    load_data=load_data,
+    save_data=save_data,
+    data_lock=DATA_LOCK,
+    get_ssh=get_ssh,
+    awg_manager_factory=lambda ssh: AWGManager(ssh),
+    protocol_base=protocol_base,
+    awg_protocols=AWG_PROTOCOLS,
+    apply_dns_via_exit=lambda sid, proto, en: exit_link_svc.set_dns_via_exit(sid, proto, en),
+)
+
 
 def _self_service_error_response(exc):
     if isinstance(exc, RateLimitError):
@@ -2286,6 +2298,7 @@ class EditServerRequest(BaseModel):
 class ReorderServersRequest(BaseModel):
     # `order[i]` is the *old* server index now at position `i` in the new layout.
     order: List[int]
+    server_uids: Optional[List[str]] = None
 
 
 class InstallProtocolRequest(BaseModel):
@@ -2360,6 +2373,28 @@ class ExitLinkRequest(BaseModel):
 class ExitDnsRequest(BaseModel):
     protocol: str = 'awg'
     enabled: bool = False
+
+
+class SmartRouteOwnSubnetsRequest(BaseModel):
+    cidrs: list = []
+
+
+class SmartRouteSplitRequest(BaseModel):
+    protocol: str = 'awg'
+    enabled: bool = False
+
+
+class SmartRouteDnsRequest(BaseModel):
+    enabled: bool = False
+
+
+class SmartRouteEnableRequest(BaseModel):
+    enabled: bool = True
+
+
+class SmartRouteDnsServersRequest(BaseModel):
+    direct: str = '77.88.8.8'
+    exit: str = '1.1.1.1'
 
 
 class Socks5SettingsRequest(BaseModel):
@@ -3249,8 +3284,40 @@ async def api_ssh_trust_confirm(request: Request, server_id: int, req: SSHTrustC
         return JSONResponse({'error': str(exc)}, status_code=409)
 
 
+def _server_identity(server_id, server_uid=None):
+    servers = load_data()['servers']
+    if not 0 <= server_id < len(servers):
+        return None, JSONResponse({'error': 'Server not found'}, status_code=404)
+    server = servers[server_id]
+    if not server.get('uid') or (server_uid is not None and server_uid != server['uid']):
+        return None, JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+    return server, None
+
+
+async def _finish_server_operation(operation):
+    """A disconnected HTTP caller must not abandon in-flight SSH mutations.
+
+    The worker owns SERVER_MUTATION_LOCK until cleanup and persistence finish;
+    cancellation is then propagated to the caller, including repeated cancels.
+    """
+    worker = asyncio.create_task(operation)
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
+
+
 @app.post('/api/servers/add', tags=["Servers"])
-def api_add_server(request: Request, req: AddServerRequest):
+async def api_add_server(request: Request, req: AddServerRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
@@ -3262,13 +3329,17 @@ def api_add_server(request: Request, req: AddServerRequest):
         if not req.password and not req.private_key:
             return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
 
-        ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key)
+        def verify():
+            ssh = SSHManager(host, req.ssh_port, username, req.password, req.private_key)
+            try:
+                ssh.connect()
+                return ssh.test_connection()
+            finally:
+                ssh.disconnect()
         try:
-            ssh.connect()
-            server_info = ssh.test_connection()
-            ssh.disconnect()
+            server_info = await asyncio.to_thread(verify)
         except Exception as e:
-            return JSONResponse({'error': f'Connection failed: {str(e)}'}, status_code=400)
+            return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
 
         server = {
             'uid': uuid.uuid4().hex,
@@ -3277,75 +3348,80 @@ def api_add_server(request: Request, req: AddServerRequest):
             'private_key': req.private_key, 'server_info': server_info,
             'protocols': {},
         }
-        data = load_data()
-        data['servers'].append(server)
-        save_data(data)
-        return {'status': 'success', 'server_id': len(data['servers']) - 1, 'server_info': server_info}
+        async with SERVER_MUTATION_LOCK:
+            async with DATA_LOCK:
+                data = load_data()
+                data['servers'].append(server)
+                save_data(data)
+                server_id = len(data['servers']) - 1
+        return {'status': 'success', 'server_id': server_id, 'server_info': server_info}
     except Exception as e:
         logger.exception("Error adding server")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
 @app.post('/api/servers/{server_id}/edit', tags=["Servers"])
-async def api_edit_server(request: Request, server_id: int, req: EditServerRequest):
-    """Update connection details for an existing server entry. Verifies the new
-    credentials by SSH-connecting before persisting, so a typo can't lock us out.
-    """
+async def api_edit_server(request: Request, server_id: int, req: EditServerRequest,
+                          server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    def edit():
-        try:
-            data = load_data()
-            if server_id >= len(data['servers']):
-                return JSONResponse({'error': 'Server not found'}, status_code=404)
-            server = data['servers'][server_id]
+    selected, error = _server_identity(server_id, server_uid)
+    if error is not None:
+        return error
+    uid = selected['uid']
 
-            new_host = (req.host or '').strip() or server['host']
-            new_user = (req.username or '').strip() or server['username']
-            new_port = int(req.ssh_port or server.get('ssh_port', 22))
-            new_name = (req.name or '').strip() or server.get('name') or new_host
-
-            # Credential resolution: a non-empty value in either field switches to
-            # that auth method (and clears the other). Both omitted => keep current.
-            if req.private_key:
-                new_pass, new_key = '', req.private_key
-            elif req.password:
-                new_pass, new_key = req.password, ''
-            else:
-                new_pass = server.get('password', '')
-                new_key = server.get('private_key', '')
-
-            if not new_pass and not new_key:
-                return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
-
-            # Verify the new connection details before committing the change.
-            ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+    async def edit():
+        async with SERVER_MUTATION_LOCK:
             try:
-                ssh.connect()
-                server_info = ssh.test_connection()
-                ssh.disconnect()
+                async with DATA_LOCK:
+                    _, server = find_server_by_uid(load_data(), uid)
+                    if server is None:
+                        return JSONResponse({'error': 'Server not found'}, status_code=404)
+                    server = dict(server)
+                new_host = (req.host or '').strip() or server['host']
+                new_user = (req.username or '').strip() or server['username']
+                new_port = int(req.ssh_port or server.get('ssh_port', 22))
+                new_name = (req.name or '').strip() or server.get('name') or new_host
+                if req.private_key:
+                    new_pass, new_key = '', req.private_key
+                elif req.password:
+                    new_pass, new_key = req.password, ''
+                else:
+                    new_pass, new_key = server.get('password', ''), server.get('private_key', '')
+                if not new_pass and not new_key:
+                    return JSONResponse({'error': 'Password or SSH key is required'}, status_code=400)
+
+                def verify():
+                    ssh = SSHManager(new_host, new_port, new_user, new_pass, new_key)
+                    try:
+                        ssh.connect()
+                        return ssh.test_connection()
+                    finally:
+                        ssh.disconnect()
+                try:
+                    server_info = await asyncio.to_thread(verify)
+                except Exception as e:
+                    return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
+
+                async with DATA_LOCK:
+                    data = load_data()
+                    _, current = find_server_by_uid(data, uid)
+                    if current is None or any(current.get(k) != server.get(k) for k in
+                                              ('host', 'ssh_port', 'username', 'password', 'private_key')):
+                        return JSONResponse({'error': 'Server changed during verification'}, status_code=409)
+                    current.update(name=new_name, host=new_host, ssh_port=new_port,
+                                   username=new_user, password=new_pass, private_key=new_key,
+                                   server_info=server_info)
+                    if req.self_service_enabled is not None:
+                        current['self_service_enabled'] = bool(req.self_service_enabled)
+                    save_data(data)
+                # Invalidate the OLD endpoint, not the just-written new address.
+                await _finish_locked_worker(lambda: drop_ssh(server))
+                return {'status': 'success', 'server_info': server_info}
             except Exception as e:
-                return JSONResponse({'error': f'Connection failed: {e}'}, status_code=400)
-
-            server['name'] = new_name
-            server['host'] = new_host
-            server['ssh_port'] = new_port
-            server['username'] = new_user
-            server['password'] = new_pass
-            server['private_key'] = new_key
-            server['server_info'] = server_info
-            if req.self_service_enabled is not None:
-                server['self_service_enabled'] = bool(req.self_service_enabled)
-            save_data(data)
-            # Drop the stale pooled connection: credentials/host may have changed.
-            drop_ssh(server)
-            return {'status': 'success', 'server_info': server_info}
-        except Exception as e:
-            logger.exception("Error editing server")
-            return JSONResponse({'error': str(e)}, status_code=500)
-
-    async with DATA_LOCK:
-        return await _finish_locked_worker(edit)
+                logger.exception("Error editing server")
+                return JSONResponse({'error': str(e)}, status_code=500)
+    return await _finish_server_operation(edit())
 
 
 @app.get('/api/servers/{server_id}/ping', tags=["Servers"])
@@ -3388,71 +3464,89 @@ async def api_server_ping(request: Request, server_id: int):
 
 @app.post('/api/servers/reorder', tags=["Servers"])
 async def api_reorder_servers(request: Request, req: ReorderServersRequest):
-    """Persist a user-defined ordering of servers. Also remaps `server_id`
-    references in user_connections so existing assignments survive the move.
-    """
+    """Remap the latest connections by stable UID, rejecting stale inventories."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    async with DATA_LOCK:
-        data = load_data()
-        n = len(data['servers'])
-        order = req.order or []
-        if len(order) != n or sorted(order) != list(range(n)):
-            return JSONResponse(
-                {'error': f'Order must be a permutation of indices 0..{n - 1}'},
-                status_code=400,
-            )
-        new_servers = [data['servers'][i] for i in order]
-        # Map old index -> new index for user_connections remap
-        remap = {old: new for new, old in enumerate(order)}
-        for c in data.get('user_connections', []):
-            old_id = c.get('server_id')
-            if isinstance(old_id, int) and old_id in remap:
-                c['server_id'] = remap[old_id]
-        # Sync settings.sync.remnawave_server_id if it points at a moved server
-        sync_cfg = data.get('settings', {}).get('sync', {})
-        rsid = sync_cfg.get('remnawave_server_id')
-        if isinstance(rsid, int) and rsid in remap:
-            sync_cfg['remnawave_server_id'] = remap[rsid]
-        data['servers'] = new_servers
-        save_data(data)
+    servers = load_data()['servers']
+    n = len(servers)
+    order = req.order or []
+    if len(order) != n or sorted(order) != list(range(n)):
+        return JSONResponse({'error': f'Order must be a permutation of indices 0..{n - 1}'}, status_code=400)
+    requested = [servers[i].get('uid') for i in order]
+    if (any(not uid for uid in requested) or len(set(requested)) != n or
+            (req.server_uids is not None and req.server_uids != requested)):
+        return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+    async with SERVER_MUTATION_LOCK:
+        async with DATA_LOCK:
+            data = load_data()
+            current = data['servers']
+            if len(current) != n or {s.get('uid') for s in current} != set(requested):
+                return JSONResponse({'error': 'Server inventory changed; refresh before reordering'}, status_code=409)
+            by_uid = {s['uid']: s for s in current}
+            new_index = {uid: i for i, uid in enumerate(requested)}
+            remap = {i: new_index[s['uid']] for i, s in enumerate(current)}
+            for c in data.get('user_connections', []):
+                old_id = c.get('server_id')
+                if isinstance(old_id, int) and old_id in remap:
+                    c['server_id'] = remap[old_id]
+            sync_cfg = data.get('settings', {}).get('sync', {})
+            rsid = sync_cfg.get('remnawave_server_id')
+            if isinstance(rsid, int) and rsid in remap:
+                sync_cfg['remnawave_server_id'] = remap[rsid]
+            data['servers'] = [by_uid[uid] for uid in requested]
+            save_data(data)
     return {'status': 'success'}
 
 
 @app.post('/api/servers/{server_id}/delete', tags=["Servers"])
-async def api_delete_server(request: Request, server_id: int):
+async def api_delete_server(request: Request, server_id: int, server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
-        # Exit-node links: restore direct egress on entries routed through
-        # this server, and drop this server's own peers on the exits it used.
-        try:
-            if (server.get('protocols') or {}).get('exit'):
-                await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_server_deleted')
-            await exit_link_svc.forget_entry_peers(server)
-        except Exception as e:
-            logger.warning(f"exit-link cleanup before delete failed: {e}")
-        async with DATA_LOCK:
-            data = load_data()
-            if server_id >= len(data['servers']):
-                return JSONResponse({'error': 'Server not found'}, status_code=404)
-            server = data['servers'][server_id]
-            await _finish_locked_worker(lambda: drop_ssh(server))
-            data['servers'].pop(server_id)
-            # Clean up connections for this server
-            data['user_connections'] = [c for c in data.get('user_connections', []) if c.get('server_id') != server_id]
-            # Adjust server_ids for connections pointing to higher indices
-            for c in data.get('user_connections', []):
-                if c.get('server_id', 0) > server_id:
-                    c['server_id'] -= 1
-            save_data(data)
-            return {'status': 'success'}
-    except Exception as e:
-        return JSONResponse({'error': str(e)}, status_code=500)
+    selected, error = _server_identity(server_id, server_uid)
+    if error is not None:
+        return error
+    uid = selected['uid']
+
+    async def delete():
+        async with SERVER_MUTATION_LOCK:
+            cleanup_completed = False
+            deletion_committed = False
+            try:
+                async with DATA_LOCK:
+                    _, server = find_server_by_uid(load_data(), uid)
+                    if server is None:
+                        return {'status': 'success', 'already_deleted': True}
+                results = []
+                if (server.get('protocols') or {}).get('exit'):
+                    results.extend(await exit_link_svc.detach_entries_for_exit(uid, 'exit_server_deleted'))
+                results.extend(await exit_link_svc.forget_entry_peers(server))
+                if any(item.get('status') != 'success' for item in results):
+                    return JSONResponse({'error': 'Exit-link cleanup incomplete; server retained',
+                                         'cleanup_results': results, 'deletion_committed': False}, status_code=409)
+                cleanup_completed = True
+                async with DATA_LOCK:
+                    data = load_data()
+                    index, current = find_server_by_uid(data, uid)
+                    if current is None:
+                        return {'status': 'success', 'already_deleted': True}
+                    data['servers'].pop(index)
+                    data['user_connections'] = [c for c in data.get('user_connections', [])
+                                                if c.get('server_id') != index]
+                    for c in data['user_connections']:
+                        if c.get('server_id', 0) > index:
+                            c['server_id'] -= 1
+                    save_data(data)
+                    deletion_committed = True
+                await _finish_locked_worker(lambda: drop_ssh(server))
+                return {'status': 'success'}
+            except Exception as e:
+                # Remote cleanup is not transactional. Keep the server on a failed
+                # local commit, report the partial result, and allow a safe retry.
+                logger.exception("Error deleting server uid=%s; cleanup_completed=%s deletion_committed=%s",
+                                 uid, cleanup_completed, deletion_committed)
+                return JSONResponse({'error': str(e), 'cleanup_completed': cleanup_completed,
+                                     'deletion_committed': deletion_committed}, status_code=500)
+    return await _finish_server_operation(delete())
 
 
 @app.post('/api/servers/{server_id}/reboot', tags=["Servers"])
@@ -3481,29 +3575,46 @@ def api_reboot_server(request: Request, server_id: int):
 
 
 @app.post('/api/servers/{server_id}/clear', tags=["Servers"])
-async def api_clear_server(request: Request, server_id: int):
+async def api_clear_server(request: Request, server_id: int, server_uid: Optional[str] = None):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
-    try:
-        data = load_data()
-        if server_id >= len(data['servers']):
-            return JSONResponse({'error': 'Server not found'}, status_code=404)
-        server = data['servers'][server_id]
+    data = load_data()
+    if not 0 <= server_id < len(data['servers']):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    selected = data['servers'][server_id]
+    uid = selected.get('uid')
+    if not uid or (server_uid is not None and server_uid != uid):
+        return JSONResponse({'error': 'Server identity changed; refresh before clearing'}, status_code=409)
+
+    def unchanged(current):
+        return current is not None and all(current.get(k) == selected.get(k)
+                                          for k in ('host', 'ssh_port', 'username', 'protocols'))
+
+    async def clear():
+        remote_completed = False
+        local_committed = False
         try:
+            async with DATA_LOCK:
+                _, server = find_server_by_uid(load_data(), uid)
+                if not unchanged(server):
+                    return JSONResponse({'error': 'Server changed before cleanup'}, status_code=409)
+            results = []
             if (server.get('protocols') or {}).get('exit'):
-                await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_cleared')
-            await exit_link_svc.forget_entry_peers(server)
-        except Exception as e:
-            logger.warning(f"exit-link cleanup before clear failed: {e}")
-        data = load_data()
-        server = data['servers'][server_id]
-        ssh = await asyncio.to_thread(get_ssh, server)
-        await asyncio.to_thread(ssh.connect)
-        # Match every Amnezia container by name prefix (catches awg/awg2/awg-legacy,
-        # wireguard, xray/ssxray, openvpn, dns, and any future amnezia-* protocol)
-        # plus the telemt container which doesn't share that prefix.
-        # Using a single script avoids one SSH round-trip per command.
-        cleanup_script = r"""
+                results.extend(await exit_link_svc.detach_entries_for_exit(uid, 'exit_cleared'))
+            results.extend(await exit_link_svc.forget_entry_peers(server))
+            if any(item.get('status') != 'success' for item in results):
+                return JSONResponse({'error': 'Exit-link cleanup incomplete; clear aborted',
+                                     'cleanup_results': results}, status_code=409)
+            async with DATA_LOCK:
+                _, server = find_server_by_uid(load_data(), uid)
+                if not unchanged(server):
+                    return JSONResponse({'error': 'Server changed during exit cleanup'}, status_code=409)
+
+            def run_remote():
+                ssh = get_ssh(server)
+                try:
+                    ssh.connect()
+                    cleanup_script = r"""
 for c in $(docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^(amnezia-|telemt$)'); do
     docker stop "$c" >/dev/null 2>&1 || true
     docker rm -fv "$c" >/dev/null 2>&1 || true
@@ -3517,15 +3628,46 @@ done
 docker network rm amnezia-dns-net >/dev/null 2>&1 || true
 rm -rf /opt/amnezia
 """
-        await asyncio.to_thread(ssh.run_sudo_script, cleanup_script, timeout=120)
+                    return ssh.run_sudo_script(cleanup_script, timeout=120)
+                finally:
+                    ssh.disconnect()
+            result = await asyncio.to_thread(run_remote)
+            if not isinstance(result, (tuple, list)) or len(result) != 3 or result[2] != 0:
+                return JSONResponse({'error': 'Remote cleanup failed; protocol metadata retained',
+                                     'remote_cleanup_completed': False, 'local_commit_completed': False}, status_code=502)
+            remote_completed = True
+            async with DATA_LOCK:
+                data = load_data()
+                _, current = find_server_by_uid(data, uid)
+                if not unchanged(current):
+                    return JSONResponse({'error': 'Server changed after remote cleanup; refresh and reconcile',
+                                         'remote_cleanup_completed': True, 'local_commit_completed': False}, status_code=409)
+                current['protocols'] = {}
+                save_data(data)
+                local_committed = True
+            return {'status': 'success'}
+        except Exception as e:
+            logger.exception("Error clearing server uid=%s; remote_completed=%s local_committed=%s",
+                             uid, remote_completed, local_committed)
+            return JSONResponse({'error': str(e), 'remote_cleanup_completed': remote_completed,
+                                 'local_commit_completed': local_committed}, status_code=500)
 
-        server['protocols'] = {}
-        save_data(data)
-        ssh.disconnect()
-        return {'status': 'success'}
-    except Exception as e:
-        logger.exception("Error clearing server")
-        return JSONResponse({'error': str(e)}, status_code=500)
+    # Do not abandon a destructive worker on HTTP disconnect. Finish its local
+    # reconciliation before propagating cancellation; DATA_LOCK is free during SSH.
+    worker = asyncio.create_task(clear())
+    cancelled = False
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    if cancelled:
+        if not worker.cancelled():
+            worker.exception()
+        raise asyncio.CancelledError
+    return worker.result()
 
 
 @app.post('/api/servers/{server_id}/stats', tags=["Servers"])
@@ -4530,6 +4672,10 @@ def _exit_link_error(e: ExitLinkError):
     return JSONResponse({'error': e.code, 'message': str(e)}, status_code=e.status_code)
 
 
+def _smartroute_error(e: SmartRouteError):
+    return JSONResponse({'error': e.code, 'message': str(e)}, status_code=e.status_code)
+
+
 @app.get('/api/exit-nodes', tags=["Servers"])
 def api_exit_nodes(request: Request):
     """Servers with an installed exit node, from data.json (no SSH)."""
@@ -4603,12 +4749,21 @@ async def api_exit_link_status(request: Request, server_id: int, req: ProtocolRe
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        return await exit_link_svc.status(server_id, req.protocol)
+        payload = await exit_link_svc.status(server_id, req.protocol)
     except ExitLinkError as e:
         return _exit_link_error(e)
     except Exception as e:
         logger.exception("Error reading exit link status")
         return JSONResponse({'error': str(e)}, status_code=500)
+    # Smart Route counters ride along best-effort: a probe failure must not
+    # hide the whole link status.
+    try:
+        payload['smartroute'] = await smartroute_svc.counters(server_id, req.protocol)
+    except Exception:
+        logger.debug("smartroute counters unavailable for server %s %s",
+                     server_id, req.protocol)
+        payload['smartroute'] = None
+    return payload
 
 
 @app.post('/api/servers/{server_id}/exit-link/check-egress', tags=["Protocols"])
@@ -4623,6 +4778,145 @@ async def api_exit_link_check_egress(request: Request, server_id: int, req: Prot
         return _exit_link_error(e)
     except Exception as e:
         logger.exception("Error checking exit egress")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/install', tags=["Protocols"])
+async def api_smartroute_install(request: Request, server_id: int):
+    """Install the host-side Smart Route updater (lists + systemd timer)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.install(server_id)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error installing Smart Route")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/uninstall', tags=["Protocols"])
+async def api_smartroute_uninstall(request: Request, server_id: int):
+    """Remove Smart Route: every split instance is rolled back to full
+    tunnel through the exit node first."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.uninstall(server_id)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error uninstalling Smart Route")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/update', tags=["Protocols"])
+async def api_smartroute_update(request: Request, server_id: int):
+    """Re-download the RU prefix lists and re-apply them now."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.run_update(server_id)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error updating Smart Route lists")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/own-subnets', tags=["Protocols"])
+async def api_smartroute_own_subnets(request: Request, server_id: int,
+                                     req: SmartRouteOwnSubnetsRequest):
+    """Own subnets routed directly (merged into every split instance)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.set_own_subnets(server_id, req.cidrs)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error saving Smart Route own subnets")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/split', tags=["Protocols"])
+async def api_smartroute_split(request: Request, server_id: int,
+                               req: SmartRouteSplitRequest):
+    """Toggle RU-direct split routing for one exit-linked instance."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.set_split(server_id, req.protocol, req.enabled)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error toggling Smart Route split")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/dns', tags=["Protocols"])
+async def api_smartroute_dns(request: Request, server_id: int,
+                             req: SmartRouteDnsRequest):
+    """Resolve DNS at the exit node for all split instances of the server."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.set_dns_via_exit(server_id, req.enabled)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error switching Smart Route DNS")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/enable', tags=["Protocols"])
+async def api_smartroute_enable(request: Request, server_id: int,
+                                req: SmartRouteEnableRequest):
+    """Global pause/resume of Smart Route on the server (card toggle).
+
+    Pausing rolls the split routing out of every split instance (traffic
+    returns to the exit node); resuming re-applies it. Lists, timer and
+    per-instance preferences are preserved."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.set_enabled(server_id, req.enabled)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error toggling Smart Route globally")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/smartroute/dns-servers', tags=["Protocols"])
+async def api_smartroute_dns_servers(request: Request, server_id: int,
+                                     req: SmartRouteDnsServersRequest):
+    """Resolver pair for split instances: the direct resolver is expected to
+    be a RU IP (routed directly), the exit resolver a foreign one (routed
+    through the exit node). Stored server-wide and pushed into every split
+    instance's client-config DNS line."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.set_dns_servers(server_id, req.direct, req.exit)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error saving Smart Route DNS pair")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.get('/api/servers/{server_id}/smartroute/status', tags=["Protocols"])
+async def api_smartroute_status(request: Request, server_id: int):
+    """App state: host lists, timer, own subnets, DNS choice, split instances."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await smartroute_svc.status(server_id)
+    except SmartRouteError as e:
+        return _smartroute_error(e)
+    except Exception as e:
+        logger.exception("Error reading Smart Route status")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
