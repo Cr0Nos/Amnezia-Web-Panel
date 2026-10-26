@@ -1475,6 +1475,16 @@ a:hover {
     font-family: 'SF Mono', 'Fira Code', monospace;
 }
 
+/* Exit link status gets its own full-width row so the badge never gets
+   squeezed into the narrow two-column cell and wrapped onto two lines. */
+.protocol-info-item-exit {
+    grid-column: 1 / -1;
+}
+
+.protocol-info-item-exit .badge {
+    align-self: stretch;
+}
+
 /* ===== Protocol backup list ===== */
 .backup-list {
     display: flex;
