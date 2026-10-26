@@ -273,6 +273,8 @@ peer_lifecycle_lock.configure(DATA_FILE)
 _panel_lease = None
 
 DATA_LOCK = asyncio.Lock()
+# Serialize overlapping traffic collection/commit cycles.
+_TRAFFIC_SYNC_LOCK = asyncio.Lock()
 # Inventory/identity operations may await SSH; unrelated JSON updates stay free.
 SERVER_MUTATION_LOCK = asyncio.Lock()
 
