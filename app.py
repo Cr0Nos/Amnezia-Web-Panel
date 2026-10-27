@@ -3901,6 +3901,50 @@ def _rkn_record(server):
     return server.get('rknblock') or {}
 
 
+def _rkn_server_index(data, server_id, server_uid):
+    """Resolve a server after a long SSH call: uid survives reorder/delete,
+    the positional index is only a fallback for legacy records."""
+    if server_uid:
+        for idx, srv in enumerate(data.get('servers', [])):
+            if srv.get('uid') == server_uid:
+                return idx
+    if isinstance(server_id, int) and 0 <= server_id < len(data.get('servers', [])):
+        return server_id
+    return None
+
+
+async def _rkn_store_record(server_id, server_uid, mutate):
+    """Reload under DATA_LOCK after SSH and persist only the RKN record.
+
+    RKN install/enable/options take seconds and the old code saved a whole
+    data.json snapshot loaded before the SSH call. A background traffic save
+    or another admin action could then overwrite the new record with a stale
+    snapshot, leaving the card at "not installed" right after a successful
+    install.
+    """
+    async with DATA_LOCK:
+        data = load_data()
+        idx = _rkn_server_index(data, server_id, server_uid)
+        if idx is None:
+            return None
+        rec = dict(data['servers'][idx].get('rknblock') or {})
+        mutate(rec)
+        data['servers'][idx]['rknblock'] = rec
+        save_data(data)
+        return rec
+
+
+async def _rkn_drop_record(server_id, server_uid):
+    async with DATA_LOCK:
+        data = load_data()
+        idx = _rkn_server_index(data, server_id, server_uid)
+        if idx is None:
+            return False
+        data['servers'][idx].pop('rknblock', None)
+        save_data(data)
+        return True
+
+
 async def _rkn_ssh_run(server, cmd, timeout):
     ssh = await asyncio.to_thread(get_ssh, server)
     await asyncio.to_thread(ssh.connect)
@@ -3926,15 +3970,20 @@ async def api_rknblock_install(request: Request, server_id: int):
     if server_id >= len(data['servers']):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     server = data['servers'][server_id]
+    server_uid = server.get('uid')
     err = await _rkn_ssh_run(server, RKN_INSTALL_CMD, 420)
     if err is not None:
         return err
-    rec = dict(_rkn_record(server))
-    rec['installed'] = True
-    rec['enabled'] = True
-    server['rknblock'] = rec
-    save_data(data)
-    RKN_FLAG_CACHE.pop(server_id, None)
+
+    def mark(rec):
+        rec['installed'] = True
+        rec['enabled'] = True
+        rec['last_error'] = None
+
+    rec = await _rkn_store_record(server_id, server_uid, mark)
+    if rec is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    RKN_FLAG_CACHE.clear()
     return {'status': 'success', 'installed': True, 'enabled': True}
 
 
@@ -3947,12 +3996,13 @@ async def api_rknblock_uninstall(request: Request, server_id: int):
     if server_id >= len(data['servers']):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     server = data['servers'][server_id]
+    server_uid = server.get('uid')
     err = await _rkn_ssh_run(server, _rkn_run_cmd('uninstall'), 180)
     if err is not None:
         return err
-    server.pop('rknblock', None)
-    save_data(data)
-    RKN_FLAG_CACHE.pop(server_id, None)
+    if not await _rkn_drop_record(server_id, server_uid):
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    RKN_FLAG_CACHE.clear()
     return {'status': 'success', 'installed': False}
 
 
@@ -3971,15 +4021,20 @@ async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEna
     server = data['servers'][server_id]
     if not _rkn_record(server).get('installed'):
         return JSONResponse({'error': 'App is not installed'}, status_code=409)
+    server_uid = server.get('uid')
     err = await _rkn_ssh_run(server, _rkn_run_cmd('on' if req.enabled else 'off'), 180)
     if err is not None:
         return err
-    rec = dict(_rkn_record(server))
-    rec['installed'] = True
-    rec['enabled'] = bool(req.enabled)
-    server['rknblock'] = rec
-    save_data(data)
-    RKN_FLAG_CACHE.pop(server_id, None)
+
+    def mark(rec):
+        rec['installed'] = True
+        rec['enabled'] = bool(req.enabled)
+        rec['last_error'] = None
+
+    rec = await _rkn_store_record(server_id, server_uid, mark)
+    if rec is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    RKN_FLAG_CACHE.clear()
     return {'status': 'success', 'enabled': bool(req.enabled)}
 
 
@@ -4024,15 +4079,20 @@ async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOp
         return JSONResponse({'error': 'App is not installed'}, status_code=409)
     values = req.model_dump()
     pairs = ' '.join(f'{k}={"on" if values[k] else "off"}' for k in RKN_OPTION_FLAGS)
+    server_uid = server.get('uid')
     err = await _rkn_ssh_run(server, _rkn_run_cmd(f'set {pairs}'), 120)
     if err is not None:
         return err
-    rec = dict(_rkn_record(server))
-    rec['installed'] = True
-    rec['flags'] = values
-    server['rknblock'] = rec
-    save_data(data)
-    RKN_FLAG_CACHE.pop(server_id, None)
+
+    def mark(rec):
+        rec['installed'] = True
+        rec['flags'] = values
+        rec['last_error'] = None
+
+    rec = await _rkn_store_record(server_id, server_uid, mark)
+    if rec is None:
+        return JSONResponse({'error': 'Server not found'}, status_code=404)
+    RKN_FLAG_CACHE.clear()
     return {'status': 'success', 'flags': values}
 
 
@@ -4068,6 +4128,12 @@ def _parse_rkn_scan_output(out, flag_enabled):
     m = re.search(r'last_update:\s*(\S+)', status_part)
     if m and m.group(1) != '—':
         last_update = m.group(1)
+    # Новый статус печатает health: ok|failed после проверки наборов и правил.
+    # Старые версии строку не печатают; тогда здоровье определяется по sets.
+    health = None
+    m = re.search(r'health:\s*(\w+)', status_part)
+    if m:
+        health = m.group(1).lower()
     events = []
     for line in (log_part or '').splitlines():
         line = line.strip()
@@ -4101,9 +4167,21 @@ def _parse_rkn_scan_output(out, flag_enabled):
         except ValueError:
             pass
 
+    sets_ok = sets.get('in4', 0) > 0 and sets.get('out4', 0) > 0
+    problems = []
+    if agent_state != 'on':
+        problems.append('not_running')
+    if not sets_ok:
+        problems.append('lists_empty')
+    if health == 'failed':
+        problems.append('health_failed')
+
     return {
         'flag_enabled': bool(flag_enabled),
         'agent_state': agent_state,
+        'health': health,
+        'sets_ok': sets_ok,
+        'problems': problems,
         'sets': sets,
         'flags': flags,
         'last_update': last_update,
@@ -4144,8 +4222,14 @@ async def api_rkn_scans(request: Request, server_id: int):
     record = server.get('rknblock') or {}
     installed = bool(record.get('installed'))
     parsed = _parse_rkn_scan_output(out, installed)
+    live_on = parsed.get('agent_state') == 'on'
     parsed['installed'] = installed
     parsed['enabled'] = bool(record.get('enabled', True)) if installed else False
+    parsed['running'] = bool(installed and live_on)
+    parsed['healthy'] = bool(installed and live_on
+                             and parsed.get('sets_ok')
+                             and parsed.get('health') != 'failed')
+    parsed['last_error'] = record.get('last_error')
     return parsed
 
 
@@ -4198,12 +4282,19 @@ async def api_rkn_scan_flags(request: Request):
             return idx, cached['data']
         try:
             out = await _fetch_rkn_scan_output(srv)
-            parsed = _parse_rkn_scan_output(out, srv.get('rkn_block_enabled', False))
+            installed = bool((srv.get('rknblock') or {}).get('installed'))
+            parsed = _parse_rkn_scan_output(out, installed)
+            live_on = parsed.get('agent_state') == 'on'
             summary = {'agent_state': parsed['agent_state'],
+                       'running': bool(installed and live_on),
+                       'healthy': bool(installed and live_on
+                                       and parsed.get('sets_ok')
+                                       and parsed.get('health') != 'failed'),
+                       'problems': parsed.get('problems', []),
                        'events24': parsed['last_24h'],
                        'last': parsed['last_event'],
-                       'flag': parsed['flag_enabled'],
-                       'installed': parsed['flag_enabled'],
+                       'flag': bool(installed),
+                       'installed': bool(installed),
                        'sets': parsed['sets']}
         except Exception:
             summary = None

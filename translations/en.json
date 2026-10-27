@@ -721,6 +721,7 @@
   "rkn_block_recent": "Recent events",
   "rkn_block_sets": "sets",
   "rkn_block_sets_empty": "sets are empty — update failed",
+  "rkn_block_not_ready": "Installed, but not active - check the lists and iptables rules",
   "rkn_block_clear": "Clear scan statistics",
   "rkn_block_clear_confirm": "Clear the scan log on the server? The red button disappears until the next scans.",
   "rkn_block_cleared": "Scan statistics cleared",
