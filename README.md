@@ -58,7 +58,7 @@ Configuration panel for system parameters and preferences:
 
 ## 🚀 Key Features
 
-*   **⚡ VPN Protocols**:
+*   **⚡ Protocols**:
     *   **AmneziaWG (AWG 3.1 / AWG 2.0 / AWG Legacy)**: Advanced WireGuard-based protocol with S3/S4 obfuscation to bypass deep packet inspection (DPI). Three coexisting variants — modern AWG 2.0 with full junk-packet masking, and a legacy variant for older clients.
     *   **Dual-stack (IPv6)**: enabled automatically only when IPv6 works end-to-end — a global address on the host *and* an IPv6 default route inside the protocol container. Docker networks are IPv4-only unless the daemon is configured for IPv6, so a host-only check would hand clients an IPv6 address with no route out. Override with the `AWG_IPV6` environment variable: `auto` (default), `off` to keep every tunnel IPv4-only, `on` to force dual-stack.
     *   **Classic WireGuard**: Standard, high-performance WireGuard protocol for unmatched speed and broad device compatibility with traffic monitoring support.
