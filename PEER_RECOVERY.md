@@ -1,11 +1,40 @@
 # Accounting recovery (administrator only)
 
-Ordinary deletion/unlink/restore still fails closed for linked peers. A disabled
-flag, SSH scrape, Stop/Down, or userspace AWG removal is **not** a final-counter
-receipt. These workflows do not claim to recover bytes already lost before a
-checkpoint. No counter is reset to make recovery succeed.
+Self-service and ordinary workflows still fail closed for linked peers. A
+disabled flag, SSH scrape, Stop/Down, or userspace AWG removal is **not** a
+final-counter receipt, so self-service deletion cannot recover bytes already
+lost before a checkpoint. No counter is reset to make recovery succeed.
 
-## Orphaned ownership
+## Admin finalization of linked peers
+
+Administrators have a dedicated finalization flow. It is the normal path for
+removing a linked peer or unlinking an owner; the orphan-recovery section below
+is for edge cases only.
+
+**Deleting a peer** (`POST /api/servers/{server_id}/connections/remove`) no
+longer hard-blocks when the peer is linked. The endpoint attempts to read a
+final counter from the remote peer, commits the resulting delta, removes the
+peer, removes the link, and writes a tombstone row to `accounting_recoveries`
+marked `counters_verified_final: false`. If the final counter cannot be read,
+the request fails closed with 409 `final_counter_read_failed` and
+`can_force: true`; the UI may retry with `allow_unverified: true` to remove the
+peer without verified final usage.
+
+**Unlinking an owner** (`POST /api/users/{user_id}/connections/unlink`) allows
+direct unlink of disabled or absent peers. Active peers require the caller to
+pass `stop: true` ("stop and unlink") — the peer is stopped on the node before
+the link is removed. The endpoint also accepts `allow_unverified: true` under
+the same conditions as the delete endpoint: only when the final counter cannot
+be read.
+
+## Orphaned ownership (edge cases only)
+
+Ordinary admin peer deletion and owner unlinking now use the **Admin
+finalization of linked peers** flow above. The orphan-recovery API below is for
+the remaining edge cases: records whose user no longer exists (dangling
+ownership), situations where ownership needs repair to another user, and
+archiving rows for peers that are verifiably absent from the node
+(`archive_absent`).
 
 Use the authenticated admin API. Browser requests must be same-origin. Neither
 self-service nor Telegram accepts recovery options.

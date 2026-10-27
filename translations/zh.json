@@ -859,5 +859,8 @@
     "smartroute_doc_fit_ok": "适用：需要更低延迟，或访问拒绝境外 IP 的俄罗斯服务，且威胁模型不包含向主机商或国家隐藏 VPN 使用事实。",
     "smartroute_doc_fit_no": "不适用：需要对运营商或国家保持匿名，或需要防止流量关联和 IP 封锁。此时请使用经出口节点的完整隧道。",
     "smartroute_doc_fail_title": "发生故障时。",
-    "smartroute_doc_fail": "如果出口节点不可达，俄罗斯流量会继续直连，其余流量会中断。关闭 Smart Route 后，实例会自动恢复为经出口节点的完整隧道。"
+    "smartroute_doc_fail": "如果出口节点不可达，俄罗斯流量会继续直连，其余流量会中断。关闭 Smart Route 后，实例会自动恢复为经出口节点的完整隧道。",
+    "delete_unverified_confirm": "无法读取最终流量计数器。是否删除且不统计最后几个字节?",
+    "unlink_stop_and_unlink_confirm": "节点处于活动状态。停止并解除关联?",
+    "unlink_unverified_confirm": "无法读取最终流量计数器。是否解除关联且不统计最后几个字节?"
 }

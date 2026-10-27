@@ -268,6 +268,15 @@ from peer_accounting import guard_user_deletions
 from peer_recovery import (RecoveryStore, RecoveryError, PanelLease, STATE_FILE_LOCK,
                            GENERATION, digest as recovery_digest, orphan_scope, validate_backup)
 from peer_recovery import verify_awg_peer_absent, check_create_journal, require_repair_target, DISASTER_HOLD
+from peer_finalization import (
+    FinalizationError,
+    connection_scope,
+    find_connection,
+    read_peer_state,
+    finalize_connection_record,
+    commit_finalize,
+    make_intent,
+)
 
 peer_lifecycle_lock.configure(DATA_FILE)
 _panel_lease = None
@@ -2504,6 +2513,7 @@ class EditConnectionRequest(BaseModel):
 class ConnectionActionRequest(BaseModel):
     protocol: str = 'awg'
     client_id: str = ''
+    allow_unverified: bool = False
 
 
 class RenameConnectionRequest(BaseModel):
@@ -2839,7 +2849,7 @@ async def startup():
             
         if migrated:
             changed = True
-            logger.info(f"Migrated user {u['username']} to new traffic/sharing fields")
+            logger.info(f"Migrated user {u.get('username', u.get('id', '?'))} to new traffic/sharing fields")
     
     # API tokens collection — initialise lazily on first run.
     if 'api_tokens' not in data:
@@ -3213,7 +3223,7 @@ def api_login(request: Request, req: LoginRequest):
 
     for u in data.get('users', []):
         # Users without a password (role 'none', record-only) can never log in.
-        if u['username'] == req.username and u.get('password_hash') and verify_password(req.password, u['password_hash']):
+        if u.get('username') == req.username and u.get('password_hash') and verify_password(req.password, u['password_hash']):
             lang = request.cookies.get('lang', 'ru')
             if u.get('role') == 'none':
                 # Record-only account: even a password set later does not
@@ -6348,27 +6358,88 @@ def api_add_connection(request: Request, server_id: int, req: AddConnectionReque
 
 @app.post('/api/servers/{server_id}/connections/remove', tags=["Connections"])
 @serialize_peer_lifecycle
-def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
+async def api_remove_connection(request: Request, server_id: int, req: ConnectionActionRequest):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
         if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol, client_id=req.client_id)
-        if guard is not None:
-            return guard
         server = data['servers'][server_id]
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        _manager_call(manager, 'remove_client', req.protocol, req.client_id)
-        ssh.disconnect()
-        # The preflight proved this peer has no local owner. Do not save
-        # the pre-SSH JSON: unrelated traffic/access commits can occur meanwhile.
-        return {'status': 'success'}
+
+        try:
+            actor = str(get_current_user(request)['id'])
+        except Exception:
+            actor = 'admin'
+        operation_id = uuid.uuid4().hex
+
+        # An owned peer must be finalized; an unowned peer can be removed raw.
+        conn = find_connection(data, server_id, req.protocol, req.client_id)
+        if conn is None:
+            ssh = get_ssh(server)
+            await asyncio.to_thread(ssh.connect)
+            manager = get_protocol_manager(ssh, req.protocol)
+            await asyncio.to_thread(_manager_call, manager, 'remove_client',
+                                    req.protocol, req.client_id)
+            ssh.disconnect()
+            return {'status': 'success', 'finalized': False}
+
+        scope = connection_scope(conn, server)
+        kind = 'peer_remove'
+        intent = make_intent(scope, 'remove')
+
+        observed_bytes = None
+        quiescent = False
+        ssh = None
+        try:
+            ssh = get_ssh(server)
+            await asyncio.to_thread(ssh.connect)
+            manager = get_protocol_manager(ssh, req.protocol)
+            observed_bytes, quiescent = await asyncio.to_thread(
+                read_peer_state, manager, req.protocol, req.client_id)
+
+            if observed_bytes is None and not quiescent and not req.allow_unverified:
+                return JSONResponse({
+                    'error': 'Could not read the final traffic counter.',
+                    'code': 'final_counter_read_failed',
+                    'can_force': True,
+                }, status_code=409)
+
+            await asyncio.to_thread(_manager_call, manager, 'remove_client',
+                                    req.protocol, req.client_id)
+        except FinalizationError as exc:
+            return JSONResponse({'error': str(exc), 'code': exc.code,
+                                 'can_force': exc.can_force}, status_code=409)
+        except Exception as exc:
+            logger.exception("Error during peer removal SSH")
+            return JSONResponse({'error': str(exc), 'code': 'removal_ssh_failed'},
+                                status_code=502)
+        finally:
+            if ssh:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
+
+        async with DATA_LOCK:
+            before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''
+            data = load_data()
+            conn = find_connection(data, server_id, req.protocol, req.client_id)
+            if conn is None:
+                return JSONResponse({'error': 'Connection link disappeared during removal'},
+                                    status_code=409)
+            mode = 'delete_unverified' if observed_bytes is None else 'delete_finalized'
+            accounting = finalize_connection_record(
+                data, conn, server, observed_bytes, time.time(), mode,
+                operation_id, quiescent)
+            result = await asyncio.to_thread(
+                commit_finalize, DATA_FILE, operation_id, actor, kind, intent,
+                before, data)
+            result['accounting'] = accounting
+            result['finalized'] = True
+            return result
     except Exception as e:
         logger.exception("Error removing connection")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -7021,37 +7092,107 @@ class UnlinkConnectionRequest(BaseModel):
     server_id: int
     protocol: str = 'awg'
     client_id: str = ''
+    stop: bool = False
+    allow_unverified: bool = False
 
 
 @app.post('/api/users/{user_id}/connections/unlink', tags=["Users"])
 @serialize_peer_lifecycle
 async def api_unlink_user_connection(request: Request, user_id: str, req: UnlinkConnectionRequest):
-    """Retain the accounting owner until a peer can be safely finalized.
+    """Unlink a peer from its owner, finalizing accounting first.
 
-    An SSH read before unlink is not a final counter: the peer may continue
-    transferring, and a periodic scrape already in flight may still need this
-    connection's baseline. A disabled user flag is not proof of remote quiescence.
+    * Disabled/absent peers can be unlinked directly (no traffic is possible).
+    * Active peers require ``stop=True``; the endpoint disables the peer first.
+    * A failed final counter read returns 409 with ``can_force=True`` so the
+      UI can ask for explicit confirmation before ``allow_unverified=True``.
     """
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+
+    try:
+        actor = str(get_current_user(request)['id'])
+    except Exception:
+        actor = 'admin'
+    operation_id = uuid.uuid4().hex
+
     async with DATA_LOCK:
         data = load_data()
-        guard = _traffic_removal_guard(data, server_id=req.server_id, protocol=req.protocol,
-                                      client_id=req.client_id, user_ids={user_id})
-        if guard is not None:
-            return guard
-        before = len(data.get('user_connections', []))
-        data['user_connections'] = [
-            c for c in data.get('user_connections', [])
-            if not (c.get('user_id') == user_id
-                    and c.get('server_id') == req.server_id
-                    and c.get('protocol') == req.protocol
-                    and c.get('client_id') == req.client_id)
-        ]
-        if len(data['user_connections']) == before:
+        if req.server_id < 0 or req.server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][req.server_id]
+        conn = find_connection(data, req.server_id, req.protocol, req.client_id,
+                               user_id=user_id)
+        if conn is None:
             return JSONResponse({'error': 'Connection link not found'}, status_code=404)
-        save_data(data)
-        return {'status': 'success'}
+        scope = connection_scope(conn, server)
+        kind = 'peer_unlink'
+        intent = make_intent(scope, 'unlink')
+
+    observed_bytes = None
+    quiescent = False
+    ssh = None
+    try:
+        ssh = get_ssh(server)
+        await asyncio.to_thread(ssh.connect)
+        manager = get_protocol_manager(ssh, req.protocol)
+        observed_bytes, quiescent = await asyncio.to_thread(
+            read_peer_state, manager, req.protocol, req.client_id)
+
+        if not quiescent and not req.stop:
+            return JSONResponse({
+                'error': 'Peer is active. Stop it first or use stop-and-unlink.',
+                'code': 'peer_active_stop_required',
+                'can_stop': True,
+            }, status_code=409)
+
+        if not quiescent and req.stop:
+            await asyncio.to_thread(_manager_call, manager, 'toggle_client',
+                                    req.protocol, req.client_id, False)
+            observed_bytes, quiescent = await asyncio.to_thread(
+                read_peer_state, manager, req.protocol, req.client_id)
+            if not quiescent:
+                return JSONResponse({
+                    'error': 'Peer could not be stopped; unlink aborted.',
+                    'code': 'peer_stop_failed',
+                }, status_code=409)
+
+        if observed_bytes is None and not quiescent and not req.allow_unverified:
+            return JSONResponse({
+                'error': 'Could not read the final traffic counter.',
+                'code': 'final_counter_read_failed',
+                'can_force': True,
+            }, status_code=409)
+    except FinalizationError as exc:
+        return JSONResponse({'error': str(exc), 'code': exc.code,
+                             'can_force': exc.can_force}, status_code=409)
+    except Exception as exc:
+        logger.exception("Error during unlink finalization SSH")
+        return JSONResponse({'error': str(exc), 'code': 'finalization_ssh_failed'},
+                            status_code=502)
+    finally:
+        if ssh:
+            try:
+                ssh.disconnect()
+            except Exception:
+                pass
+
+    async with DATA_LOCK:
+        before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''
+        data = load_data()
+        conn = find_connection(data, req.server_id, req.protocol, req.client_id,
+                               user_id=user_id)
+        if conn is None:
+            return JSONResponse({'error': 'Connection link not found'},
+                                status_code=404)
+        mode = 'unlink_stopped' if req.stop else 'unlink_finalized'
+        accounting = finalize_connection_record(
+            data, conn, server, observed_bytes, time.time(), mode,
+            operation_id, quiescent)
+        result = await asyncio.to_thread(
+            commit_finalize, DATA_FILE, operation_id, actor, kind, intent,
+            before, data)
+        result['accounting'] = accounting
+        return result
 
 
 @app.get('/api/users/{user_id}/connections', tags=["Users"])
