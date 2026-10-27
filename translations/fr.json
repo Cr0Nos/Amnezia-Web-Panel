@@ -859,5 +859,8 @@
     "smartroute_doc_fit_ok": "Adapté : vous avez besoin d'une latence plus faible ou d'accéder à des services RU qui refusent les IP étrangères, et masquer l'usage du VPN à l'hébergeur ou à l'État ne fait pas partie de votre modèle de menace.",
     "smartroute_doc_fit_no": "Non adapté : vous avez besoin d'anonymat vis-à-vis du FAI ou de l'État, ou d'une protection contre la corrélation du trafic et le blocage par IP. Utilisez alors le tunnel complet via le nœud de sortie.",
     "smartroute_doc_fail_title": "En cas d'incident.",
-    "smartroute_doc_fail": "Si le nœud de sortie devient injoignable, le trafic RU continue de sortir directement tandis que le reste s'arrête. Lorsque Smart Route est désactivé, l'instance revient automatiquement au tunnel complet via la sortie."
+    "smartroute_doc_fail": "Si le nœud de sortie devient injoignable, le trafic RU continue de sortir directement tandis que le reste s'arrête. Lorsque Smart Route est désactivé, l'instance revient automatiquement au tunnel complet via la sortie.",
+    "delete_unverified_confirm": "Impossible de lire le compteur de trafic final. Supprimer sans comptabiliser les derniers octets ?",
+    "unlink_stop_and_unlink_confirm": "Le pair est actif. L’arrêter et le dissocier ?",
+    "unlink_unverified_confirm": "Impossible de lire le compteur de trafic final. Dissocier sans comptabiliser les derniers octets ?"
 }

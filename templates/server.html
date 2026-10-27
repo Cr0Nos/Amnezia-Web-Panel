@@ -4246,7 +4246,7 @@
                             <button class="btn btn-secondary btn-sm btn-icon" onclick="showConnectionConfig('${escapeJs(client.clientId)}', '${escapeJs(name)}', ${!!userData.clientPrivateKey || proto === 'xray' || proto === 'telemt'})" title="${_('config')}">📄</button>
                             ${proto === 'telemt' ? `<button class="btn btn-secondary btn-sm btn-icon" onclick="editConnection('${escapeJs(client.clientId)}')" title="${_('edit')}">⚙️</button>` : ''}
                             <button class="btn btn-secondary btn-sm btn-icon ${toggleClass}" onclick="toggleConnection('${escapeJs(client.clientId)}', ${!enabled}, this)" title="${toggleTitle}">💡</button>
-                            <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}')" title="${_('delete')}">${ICON_TRASH}</button>
+                            <button class="btn btn-danger btn-sm btn-icon" onclick="removeConnection('${escapeJs(client.clientId)}', ${enabled})" title="${_('delete')}">${ICON_TRASH}</button>
                         </div>
                     </div>
                 `;
@@ -4408,7 +4408,7 @@
         }
     }
 
-    async function removeConnection(clientId) {
+    async function removeConnection(clientId, enabled) {
         if (!confirm(_('delete_connection_confirm'))) return;
         const proto = document.getElementById('connProtoSelect').value;
         try {
@@ -4418,6 +4418,21 @@
             showToast(_('connection_deleted'), 'success');
             loadConnections();
         } catch (err) {
+            if (err.payload && err.payload.code === 'final_counter_read_failed' && err.payload.can_force) {
+                if (confirm(_('delete_unverified_confirm'))) {
+                    try {
+                        await apiCall(`/api/servers/${SERVER_ID}/connections/remove`, 'POST', {
+                            protocol: proto, client_id: clientId,
+                            allow_unverified: true,
+                        });
+                        showToast(_('connection_deleted'), 'success');
+                        loadConnections();
+                    } catch (retryErr) {
+                        showToast(_('error') + ': ' + retryErr.message, 'error');
+                    }
+                }
+                return;
+            }
             showToast(_('error') + ': ' + err.message, 'error');
         }
     }

@@ -859,5 +859,8 @@
     "smartroute_doc_fit_ok": "Fits: you need lower latency or access to RU services that reject foreign IPs, and your threat model does not include hiding the fact of VPN use from the hoster or the state.",
     "smartroute_doc_fit_no": "Does not fit: you need anonymity from the ISP or state, or protection against traffic correlation and IP blocking. Use the full tunnel through the exit node instead.",
     "smartroute_doc_fail_title": "If something breaks.",
-    "smartroute_doc_fail": "If the exit node becomes unreachable, RU traffic keeps going directly while the rest stops. When Smart Route is disabled, the instance automatically returns to the full tunnel through the exit."
+    "smartroute_doc_fail": "If the exit node becomes unreachable, RU traffic keeps going directly while the rest stops. When Smart Route is disabled, the instance automatically returns to the full tunnel through the exit.",
+    "delete_unverified_confirm": "Could not read the final traffic counter. Delete without accounting for the last bytes?",
+    "unlink_stop_and_unlink_confirm": "Peer is active. Stop it and unlink?",
+    "unlink_unverified_confirm": "Could not read the final traffic counter. Unlink without accounting for the last bytes?"
 }
