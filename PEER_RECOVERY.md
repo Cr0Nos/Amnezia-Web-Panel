@@ -1,5 +1,9 @@
 # Accounting recovery (administrator only)
 
+For complete state archives and safe offline staging, see
+[PANEL_BACKUP.md](PANEL_BACKUP.md). The legacy JSON export does not include trust
+or all sidecar journals. Archives never bypass the recovery restrictions below.
+
 Self-service and ordinary workflows still fail closed for linked peers. A
 disabled flag, SSH scrape, Stop/Down, or userspace AWG removal is **not** a
 final-counter receipt, so self-service deletion cannot recover bytes already

@@ -862,5 +862,11 @@
     "smartroute_doc_fail": "Si le nœud de sortie devient injoignable, le trafic RU continue de sortir directement tandis que le reste s'arrête. Lorsque Smart Route est désactivé, l'instance revient automatiquement au tunnel complet via la sortie.",
     "delete_unverified_confirm": "Impossible de lire le compteur de trafic final. Supprimer sans comptabiliser les derniers octets ?",
     "unlink_stop_and_unlink_confirm": "Le pair est actif. L’arrêter et le dissocier ?",
-    "unlink_unverified_confirm": "Impossible de lire le compteur de trafic final. Dissocier sans comptabiliser les derniers octets ?"
+    "unlink_unverified_confirm": "Impossible de lire le compteur de trafic final. Dissocier sans comptabiliser les derniers octets ?",
+    "full_backup_warning": "Contient des données VPN/SSH privées. Conservez cette archive privée et chiffrée.",
+    "full_backup_scope": "Inclut les données du panneau, la confiance SSH, les journaux des pairs et les instantanés de récupération. Sauvegardez séparément Compose, les secrets et les certificats externes.",
+    "full_backup_offline": "La restauration complète exige un arrêt et une vérification indépendante des nœuds VPN. La restauration JSON ci-dessous est limitée.",
+    "legacy_json_backup": "Ancien export JSON (sauvegarde incomplète)",
+    "full_backup_busy": "État occupé ou instantané cohérent indisponible. Attendez la fin des opérations et réessayez ; vérifiez le stockage privé si nécessaire.",
+    "full_backup_error": "Téléchargement impossible. Vérifiez les droits administrateur et le stockage."
 }
