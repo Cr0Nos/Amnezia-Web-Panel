@@ -1,6 +1,7 @@
 """Serialize peer/inventory mutations without holding the data lock over SSH."""
 import asyncio
 import contextvars
+from contextlib import asynccontextmanager
 import functools
 import inspect
 import logging
@@ -46,6 +47,28 @@ def diagnostics():
 def check_remote_fence():
     if _fenced or (_fence_path and _fence_path.exists()):
         raise PeerLifecycleUncertain('peer_lifecycle_uncertain')
+
+
+@asynccontextmanager
+async def snapshot_interlock():
+    """Quiesce managed lifecycle writes for a local backup, including fences.
+
+    A fence is archived as evidence, never cleared. This read-only operation
+    does not claim remote quiescence or final counters. One panel process only.
+    """
+    loop = asyncio.get_running_loop()
+    lock = _mutation_locks.setdefault(loop, asyncio.Lock())
+    if _active.get():
+        raise PeerLifecycleBusy('backup_during_lifecycle')
+    try:
+        async with asyncio.timeout(QUEUE_WAIT_SECONDS):
+            await lock.acquire()
+    except asyncio.TimeoutError:
+        raise PeerLifecycleBusy('peer_lifecycle_busy') from None
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 def note_ssh_uncertainty():
