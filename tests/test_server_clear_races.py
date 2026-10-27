@@ -23,7 +23,8 @@ class ClearTests(unittest.IsolatedAsyncioTestCase):
         self.path = Path(self.tmp.name) / 'data.json'
         source = Path(__file__).resolve().parents[1] / 'app.py'
         tree = ast.parse(source.read_text(encoding='utf-8'))
-        names = {'load_data', 'save_data', 'find_server_by_uid', 'api_clear_server'}
+        names = {'load_data', 'save_data', 'find_server_by_uid', 'api_clear_server',
+                 '_traffic_removal_guard'}
         nodes = [n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in names]
         for n in nodes:
             n.decorator_list = []

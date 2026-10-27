@@ -2379,7 +2379,7 @@
                     grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('connections')}</span><span class="protocol-info-value">${info.clients_count}</span></div>`;
                 }
                 if (!isService && info.exit_link) {
-                    grid += `<div class="protocol-info-item"><span class="protocol-info-label">${_('exit_link_via')}</span><span class="protocol-info-value">${escapeHtml(info.exit_link.exit_name || '')} ${exitStatusBadge(info.exit_link_status, info.exit_link)}</span></div>`;
+                    grid += `<div class="protocol-info-item protocol-info-item-exit"><span class="protocol-info-label">${_('exit_link_via')}</span><span class="protocol-info-value">${escapeHtml(info.exit_link.exit_name || '')}</span>${exitStatusBadge(info.exit_link_status, info.exit_link)}</div>`;
                 }
                 infoGrid.innerHTML = grid;
             }
