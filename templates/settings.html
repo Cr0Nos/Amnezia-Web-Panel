@@ -11,6 +11,7 @@
     </h1>
 </div>
 
+<div id="settings-nav-anchor" aria-hidden="true"></div>
 <nav class="settings-nav" aria-label="{{ _('settings_title') }}">
     <a href="#settings-appearance">{{ _('appearance') }}</a>
     <a href="#settings-captcha">{{ _('captcha_title') }}</a>
@@ -1392,4 +1393,5 @@
         tunnelStatusTimer = setInterval(loadTunnelStatus, 10000);
     });
 </script>
+<script src="/static/js/settings-nav.js?v={{ static_v }}" defer></script>
 {% endblock %}

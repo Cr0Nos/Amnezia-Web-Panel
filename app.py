@@ -207,7 +207,7 @@ DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
 ssh_trust.configure(DATA_FILE)
-CURRENT_VERSION = "v1.8.1"
+CURRENT_VERSION = "v1.8.2"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
 CUSTOM_PROTOCOL_NAME_MAX = 64
@@ -8093,13 +8093,14 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...),
             replay = store.replay(op, actor, 'ordinary_restore', intent)
             if replay:
                 return replay
-            guard = _traffic_removal_guard(current, include_archived=True)
-            if guard is not None:
-                guard.body = json.dumps({'error': 'Ordinary restore cannot rewind owned usage. Use the offline administrator disaster-recovery workflow.',
-                                         'code': 'traffic_finalization_required',
-                                         'recovery': 'scripts/panel_recovery.py'}).encode()
-                guard.headers['content-length'] = str(len(guard.body))
-                return guard
+            from peer_recovery import prepare_online_restore
+            try:
+                backup_data = prepare_online_restore(current, backup_data)
+            except RecoveryError:
+                return JSONResponse({
+                    'error': 'Online restore requires unchanged servers, connections and user policy; current traffic accounting is retained. Use the offline administrator disaster-recovery workflow for incompatible backups.',
+                    'code': 'traffic_finalization_required',
+                    'recovery': 'scripts/panel_recovery.py'}, status_code=409)
             with STATE_FILE_LOCK:
                 check_create_journal(DATA_FILE, replacement=backup_data)
                 before = pathlib_read_data_bytes() if os.path.exists(DATA_FILE) else b''

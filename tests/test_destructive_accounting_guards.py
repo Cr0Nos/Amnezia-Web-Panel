@@ -74,6 +74,20 @@ class DestructiveAccountingGuards(unittest.IsolatedAsyncioTestCase):
             result = await panel.api_remove_connection(self.request, 0, req)
         self.finalized(result, saved[-1] if saved else None)
 
+    async def test_remove_unknown_counter_requires_explicit_confirmation(self):
+        with patch.object(panel, 'get_ssh', return_value=Mock()), \
+             patch.object(panel, 'get_protocol_manager', return_value=Mock()), \
+             patch.object(panel, '_manager_call') as remote, \
+             patch.object(panel, 'read_peer_state', return_value=(None, False)), \
+             patch.object(panel, 'commit_finalize') as commit:
+            result = await panel.api_remove_connection(
+                self.request, 0, panel.ConnectionActionRequest(protocol='awg3', client_id='peer'))
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(json.loads(result.body)['code'], 'final_counter_read_failed')
+        self.assertTrue(json.loads(result.body)['can_force'])
+        remote.assert_not_called()
+        commit.assert_not_called()
+
     async def test_server_delete_and_clear_are_guarded_before_exit_cleanup(self):
         for name in ('api_delete_server', 'api_clear_server'):
             with self.subTest(name=name):
@@ -90,7 +104,7 @@ class DestructiveAccountingGuards(unittest.IsolatedAsyncioTestCase):
         self.rejected(await panel.api_protocol_backup_restore(self.request, 0, req))
 
     async def test_panel_restore_cannot_remove_owner_or_rewind_baselines(self):
-        for data in ({'servers': [], 'users': []}, self.data):
+        for data in ({'servers': [], 'users': []}, dict(self.data, user_connections=[])):
             with self.subTest(data=data):
                 file = UploadFile(filename='backup.json', file=io.BytesIO(json.dumps(data).encode()))
                 self.rejected(await panel.api_backup_restore(self.request, file))

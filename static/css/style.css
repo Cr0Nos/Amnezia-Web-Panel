@@ -571,6 +571,12 @@ a:hover {
     pointer-events: none;
 }
 
+#settings-nav-anchor {
+    height: 1px;
+    margin-bottom: -1px;
+    pointer-events: none;
+}
+
 .settings-nav {
     display: flex;
     flex-wrap: wrap;
@@ -580,7 +586,15 @@ a:hover {
     top: 0;
     z-index: 30;
     padding: var(--space-sm) 0;
+    transition: background-color 160ms ease, box-shadow 160ms ease;
+}
+
+.settings-nav.is-stuck {
     background: var(--bg-primary);
+    background: color-mix(in srgb, var(--bg-primary) 92%, transparent);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 8px 18px -12px rgba(0, 0, 0, 0.5);
 }
 
 .settings-nav a {
@@ -2556,7 +2570,6 @@ body,
         margin-right: 0;
         margin-bottom: var(--space-md);
         padding: calc(env(safe-area-inset-top, 0px) + 10px) 0 10px;
-        background: var(--bg-primary);
         border-bottom: 1px solid var(--border-color);
     }
 

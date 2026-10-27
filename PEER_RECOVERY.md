@@ -5,6 +5,20 @@ disabled flag, SSH scrape, Stop/Down, or userspace AWG removal is **not** a
 final-counter receipt, so self-service deletion cannot recover bytes already
 lost before a checkpoint. No counter is reset to make recovery succeed.
 
+## Online JSON backup restore
+
+Ordinary JSON restore accepts backups with unchanged servers, connection
+configuration/ownership, user policy and accounting archive. Current user
+traffic totals, reset timestamps, synchronization revisions and complete
+connection rows are retained, not restored from the backup. Settings can be
+restored without rewinding usage. The recovery generation and disaster hold
+are retained as well. No SSH commands are executed by this operation.
+
+Backups that change these protected records still return HTTP 409 and require
+the offline disaster-recovery workflow below. This includes backups made before
+a peer was added, reassigned or deleted. A fresh installation without accounting
+records can still import a backup normally.
+
 ## Admin finalization of linked peers
 
 Administrators have a dedicated finalization flow. It is the normal path for

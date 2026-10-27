@@ -27,6 +27,64 @@ class RecoveryError(RuntimeError):
     pass
 
 
+def prepare_online_restore(current, backup):
+    """Restore compatible settings without rewinding live accounting.
+
+    An online restore is not a topology/policy migration. Keep this deliberately
+    strict: changed servers, owners, peer configuration or user policy require
+    offline recovery. Work on copies so rejected/replayed requests are inert.
+    """
+    result = copy.deepcopy(backup)
+    if not (current.get('user_connections') or current.get('accounting_recoveries')):
+        if DISASTER_HOLD in current:
+            result[DISASTER_HOLD] = copy.deepcopy(current[DISASTER_HOLD])
+        return result
+
+    def incompatible():
+        raise RecoveryError('online_restore_accounting_conflict')
+
+    if current.get('servers', []) != backup.get('servers', []):
+        incompatible()
+    if current.get('accounting_recoveries', []) != backup.get('accounting_recoveries', []):
+        incompatible()
+
+    runtime_user = {'traffic_used', 'traffic_total', 'last_reset_at',
+                    'access_revision', 'access_sync_pending'}
+    runtime_connection = {'last_bytes', 'traffic_observed_at'}
+
+    def indexed(rows, ignored):
+        if not isinstance(rows, list):
+            incompatible()
+        indexed_rows = {}
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(row.get('id'), (str, int)):
+                incompatible()
+            key = row['id']
+            if key in indexed_rows:
+                incompatible()
+            indexed_rows[key] = {k: v for k, v in row.items() if k not in ignored}
+        return indexed_rows
+
+    users = indexed(current.get('users', []), runtime_user)
+    if users != indexed(backup.get('users', []), runtime_user):
+        incompatible()
+    connections = indexed(current.get('user_connections', []), runtime_connection)
+    if connections != indexed(backup.get('user_connections', []), runtime_connection):
+        incompatible()
+    for conn in current.get('user_connections', []):
+        sid = conn.get('server_id')
+        if (conn.get('user_id') not in users or type(sid) is not int
+                or not 0 <= sid < len(current.get('servers', []))):
+            incompatible()
+
+    for key in ('users', 'user_connections', 'accounting_recoveries', GENERATION, DISASTER_HOLD):
+        if key in current:
+            result[key] = copy.deepcopy(current[key])
+        else:
+            result.pop(key, None)
+    return result
+
+
 def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'),
                                      ensure_ascii=False, allow_nan=False).encode()).hexdigest()
