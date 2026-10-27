@@ -2490,6 +2490,15 @@ done < "$BW"
                 self.ssh._awg_batch = None
 
     @staticmethod
+    def _normalize_server_config(config_content):
+        """Keep appending native [Peer] blocks safe after every config write.
+
+        SSH stdout strips the original EOF newline. Normalize at the write
+        boundary without changing keys, addresses or interior whitespace.
+        """
+        return config_content.replace(chr(13) + '\n', '\n').rstrip('\n') + '\n'
+
+    @staticmethod
     def _sanitize_server_config(config_content):
         """awg-quick chokes on a bare `DNS =` key in the server config (it calls
         resolvconf, which is missing in the container, and the interface goes
@@ -2514,7 +2523,7 @@ done < "$BW"
         config_path = self._resolve_config_path(protocol_type)
 
         # Upload new config into container via SFTP + docker cp
-        self.ssh.upload_file(config_content.replace('\r\n', '\n'), "/tmp/_amnz_edit_config.conf")
+        self.ssh.upload_file(self._normalize_server_config(config_content), "/tmp/_amnz_edit_config.conf")
         self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_edit_config.conf {container_name}:{config_path}")
         self.ssh.run_command("rm -f /tmp/_amnz_edit_config.conf")
 
@@ -2698,7 +2707,7 @@ done < "$BW"
 
         new_config = head.rstrip('\n') + '\n\n' + '\n\n'.join(blocks) + '\n'
 
-        self.ssh.upload_file(new_config, "/tmp/_amnz_add_peer.conf")
+        self.ssh.upload_file(self._normalize_server_config(new_config), "/tmp/_amnz_add_peer.conf")
         self.ssh.run_sudo_command(
             f"docker cp /tmp/_amnz_add_peer.conf {container_name}:{config_path}"
         )
@@ -3524,7 +3533,7 @@ PersistentKeepalive = 25
                 new_sections.append(section)
 
             new_config = '[' + '['.join(new_sections)
-            self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+            self.ssh.upload_file(self._normalize_server_config(new_config), "/tmp/_amnz_config.conf")
             self.ssh.run_sudo_command(
                 f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
             )
@@ -3625,7 +3634,7 @@ PersistentKeepalive = 25
         new_config = '[' + '['.join(new_sections)
 
         # Upload new config into container via SFTP + docker cp
-        self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+        self.ssh.upload_file(self._normalize_server_config(new_config), "/tmp/_amnz_config.conf")
         self.ssh.run_sudo_command(
             f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
         )
@@ -3852,7 +3861,7 @@ PersistentKeepalive = 25
         """Upload the server config into the container without restarting it."""
         container_name = self._container_name(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
-        self.ssh.upload_file(config_content.replace('\r\n', '\n'), "/tmp/_amnz_settings.conf")
+        self.ssh.upload_file(self._normalize_server_config(config_content), "/tmp/_amnz_settings.conf")
         out, err, code = self.ssh.run_sudo_command(
             f"docker cp /tmp/_amnz_settings.conf {container_name}:{config_path}"
         )
