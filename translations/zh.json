@@ -865,5 +865,11 @@
     "smartroute_doc_fail": "如果出口节点不可达，俄罗斯流量会继续直连，其余流量会中断。关闭 Smart Route 后，实例会自动恢复为经出口节点的完整隧道。",
     "delete_unverified_confirm": "无法读取最终流量计数器。是否删除且不统计最后几个字节?",
     "unlink_stop_and_unlink_confirm": "节点处于活动状态。停止并解除关联?",
-    "unlink_unverified_confirm": "无法读取最终流量计数器。是否解除关联且不统计最后几个字节?"
+    "unlink_unverified_confirm": "无法读取最终流量计数器。是否解除关联且不统计最后几个字节?",
+    "full_backup_warning": "包含私密 VPN/SSH 数据。请私密且加密地保存此备份。",
+    "full_backup_scope": "包含面板数据、SSH 信任、节点操作日志和恢复快照。请单独保存 Compose、环境密钥及外部证书。",
+    "full_backup_offline": "完整恢复必须离线进行，并独立核对 VPN 节点状态。下方 JSON 恢复仅支持旧格式。",
+    "legacy_json_backup": "旧版 JSON 导出（非完整备份）",
+    "full_backup_busy": "状态正忙或无法取得一致快照。请等待操作完成后重试；若持续失败，请检查私有存储。",
+    "full_backup_error": "无法下载备份。请检查管理员权限和存储。"
 }

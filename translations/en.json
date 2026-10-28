@@ -865,5 +865,11 @@
     "smartroute_doc_fail": "If the exit node becomes unreachable, RU traffic keeps going directly while the rest stops. When Smart Route is disabled, the instance automatically returns to the full tunnel through the exit.",
     "delete_unverified_confirm": "Could not read the final traffic counter. Delete without accounting for the last bytes?",
     "unlink_stop_and_unlink_confirm": "Peer is active. Stop it and unlink?",
-    "unlink_unverified_confirm": "Could not read the final traffic counter. Unlink without accounting for the last bytes?"
+    "unlink_unverified_confirm": "Could not read the final traffic counter. Unlink without accounting for the last bytes?",
+    "full_backup_warning": "Contains private VPN/SSH data. Keep this archive private and encrypted.",
+    "full_backup_scope": "Includes panel data, SSH trust, peer journals and recovery snapshots. Save Compose, environment/secrets and external certificates separately.",
+    "full_backup_offline": "Complete archives can only be restored offline after independent VPN-node reconciliation. The JSON restore below is a limited legacy operation.",
+    "legacy_json_backup": "Legacy JSON export (not a complete backup)",
+    "full_backup_busy": "State is busy or could not be read consistently. Wait for pending operations, then retry; inspect private storage if the error persists.",
+    "full_backup_error": "Backup could not be downloaded. Check administrator access and storage."
 }
