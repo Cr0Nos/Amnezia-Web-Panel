@@ -2763,8 +2763,16 @@ done < "$BW"
                 peers[current_key]['allowedIps'] = line.split('=', 1)[1].strip()
         return peers
 
+    def get_traffic_snapshot(self, protocol_type):
+        """Exact counters; unlike get_clients, never falls back to clientsTable."""
+        from managers.traffic_counters import read_transfer_snapshot
+        path = self._resolve_config_path(protocol_type)
+        return read_transfer_snapshot(self.ssh, self._container_name(protocol_type),
+                                      self._wg_binary(protocol_type),
+                                      self._interface_name(protocol_type, path))
+
     def get_clients(self, protocol_type):
-        """Get list of all clients."""
+        """Display data with cache fallbacks; accounting uses get_traffic_snapshot."""
         clients_table = self._get_clients_table(protocol_type)
 
         # Also try to get live data from wg show

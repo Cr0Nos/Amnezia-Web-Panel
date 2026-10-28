@@ -745,8 +745,13 @@ tail -f /dev/null
                     result[current_peer]['endpoint'] = '' if value in ('', '(none)') else value
         return result
 
+    def get_traffic_snapshot(self):
+        """Exact counters; the UI's cached/human-readable values are not samples."""
+        from managers.traffic_counters import read_transfer_snapshot
+        return read_transfer_snapshot(self.ssh, self.CONTAINER_NAME, 'wg', self.INTERFACE)
+
     def get_clients(self):
-        """Get list of all clients with live traffic data."""
+        """Display data with cache fallbacks; accounting uses get_traffic_snapshot."""
         clients_table = self._get_clients_table()
 
         try:
