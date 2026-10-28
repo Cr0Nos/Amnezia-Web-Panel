@@ -50,7 +50,8 @@ def prepare_online_restore(current, backup):
 
     runtime_user = {'traffic_used', 'traffic_total', 'last_reset_at',
                     'access_revision', 'access_sync_pending'}
-    runtime_connection = {'last_bytes', 'traffic_observed_at'}
+    runtime_connection = {'last_bytes', 'traffic_observed_at', 'traffic_counter_epoch',
+                          'last_rx_bytes', 'last_tx_bytes', 'traffic_accounting_gap'}
 
     def indexed(rows, ignored):
         if not isinstance(rows, list):

@@ -88,15 +88,41 @@ def apply_traffic_samples(data, samples, now):
         if sample['observed_at'] <= conn.get('traffic_observed_at', 0):
             continue
         current = sample['bytes']
-        if not isinstance(current, int) or current < 0:
+        if type(current) is not int or current < 0 or sample.get('counter_valid') is False:
             continue
-        previous = conn.get('last_bytes', 0)
-        delta = current - previous if current >= previous else current
-        conn['last_bytes'] = current
-        conn['traffic_observed_at'] = sample['observed_at']
+        epoch = sample.get('counter_epoch')
+        if epoch is not None:
+            # Validate the complete sample before touching either baseline.
+            rx, tx = sample.get('rx_bytes'), sample.get('tx_bytes')
+            if (not isinstance(epoch, str) or not epoch or len(epoch) > 128
+                    or type(rx) is not int or type(tx) is not int
+                    or rx < 0 or tx < 0 or current != rx + tx):
+                continue
         user = users.get(conn['user_id'])
         if user is None:
-            continue
+            continue  # An orphan must not silently consume its accounting baseline.
+        previous = conn.get('last_bytes', 0)
+        previous_epoch = conn.get('traffic_counter_epoch')
+        epoch_changed = epoch is not None and previous_epoch is not None and epoch != previous_epoch
+        decreased = current < previous
+        if epoch is not None and previous_epoch == epoch:
+            decreased = decreased or any(sample[key] < conn.get('last_' + key, sample[key])
+                                        for key in ('rx_bytes', 'tx_bytes'))
+        delta = current if epoch_changed or decreased else current - previous
+        if epoch_changed or decreased:
+            # Preserve the last observed old baseline, not a fabricated final
+            # counter. Bytes after that observation and before reset are unknown.
+            conn['traffic_accounting_gap'] = {
+                'reason': 'epoch_changed' if epoch_changed else 'counter_decreased',
+                'previous_bytes': previous, 'previous_epoch': previous_epoch,
+                'observed_at': sample['observed_at'],
+                'counters_verified_final': False,
+            }
+        conn['last_bytes'] = current
+        conn['traffic_observed_at'] = sample['observed_at']
+        if epoch is not None:
+            conn['traffic_counter_epoch'] = epoch
+            conn['last_rx_bytes'], conn['last_tx_bytes'] = rx, tx
         user['traffic_total'] = user.get('traffic_total', 0) + delta
         # A scrape started before a manual reset must not undo that reset.
         try:

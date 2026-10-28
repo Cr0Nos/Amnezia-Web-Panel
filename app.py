@@ -3010,33 +3010,75 @@ async def run_auto_backups_if_due():
 
 
 def _scrape_server_traffic(server, sid, my_conns):
+    from collections import Counter
+    from managers.traffic_counters import counter
+    from peer_accounting import _protocol_scope
+
     server_updates = []
+    ssh = None
     try:
         ssh = get_ssh(server)
         ssh.connect()
-        for proto in ['awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard']:
-            if proto in server.get('protocols', {}):
+        # The manager resolves first-instance aliases to the same container.
+        # Query each physical scope once, retaining each link's full protocol.
+        scopes = {}
+        for proto, record in server.get('protocols', {}).items():
+            if (str(proto).split('__', 1)[0] in ('awg', 'awg2', 'awg3', 'awg_legacy', 'xray', 'telemt', 'wireguard')
+                    and isinstance(record, dict) and record.get('installed', True)):
+                scopes.setdefault(_protocol_scope(proto), proto)
+        owners = Counter((_protocol_scope(c['protocol']), c['client_id']) for c in my_conns)
+        for scope, proto in scopes.items():
+            try:
                 manager = get_protocol_manager(ssh, proto)
                 observed_at = time.time()
-                clients = _manager_call(manager, 'get_clients', proto)
-                client_bytes = {}
-                for c in clients:
-                    rx = c.get('userData', {}).get('dataReceivedBytes', 0)
-                    tx = c.get('userData', {}).get('dataSentBytes', 0)
-                    client_bytes[c.get('clientId')] = rx + tx
-                    
+                epoch = None
+                if scope[0] in ('awg', 'awg2', 'awg3', 'awg_legacy', 'wireguard'):
+                    snapshot = _manager_call(manager, 'get_traffic_snapshot', proto)
+                    epoch, peer_counters = snapshot['epoch'], snapshot['peers']
+                    if not isinstance(epoch, str) or not epoch:
+                        raise ValueError('Counter epoch missing')
+                else:
+                    # Other protocols keep their adapters, but missing, bool,
+                    # malformed or cached counters must not become zero either.
+                    peer_counters = {}
+                    for client in _manager_call(manager, 'get_clients', proto):
+                        ud = client.get('userData', {})
+                        if ud.get('traffic_valid', True):
+                            peer_counters[client.get('clientId')] = {
+                                'rx_bytes': ud.get('dataReceivedBytes'),
+                                'tx_bytes': ud.get('dataSentBytes'),
+                            }
                 for uc in my_conns:
-                    if uc['protocol'] == proto and uc['client_id'] in client_bytes:
-                        curr_bytes = client_bytes[uc['client_id']]
-                        server_updates.append({
-                            'id': uc['id'], 'user_id': uc['user_id'],
-                            'protocol': proto, 'client_id': uc['client_id'],
-                            'server_identity': traffic_server_identity(server),
-                            'bytes': curr_bytes, 'observed_at': observed_at,
-                        })
-        ssh.disconnect()
-    except Exception as e:
-        logger.error(f"Traffic sync err server {sid}: {e}")
+                    if _protocol_scope(uc['protocol']) != scope:
+                        continue
+                    if owners[(scope, uc['client_id'])] != 1:
+                        logger.warning('Traffic ownership ambiguous on server %s; sample skipped', sid)
+                        continue
+                    values = peer_counters.get(uc['client_id'], {})
+                    rx, tx = values.get('rx_bytes'), values.get('tx_bytes')
+                    if not counter(rx) or not counter(tx):
+                        continue
+                    sample = {
+                        'id': uc['id'], 'user_id': uc['user_id'],
+                        'protocol': uc['protocol'], 'client_id': uc['client_id'],
+                        'server_identity': traffic_server_identity(server),
+                        'bytes': rx + tx, 'observed_at': observed_at,
+                    }
+                    if epoch is not None:
+                        sample.update(rx_bytes=rx, tx_bytes=tx, counter_epoch=epoch)
+                    server_updates.append(sample)
+            except Exception:
+                # One unavailable instance must not starve the other instances.
+                # Never include arbitrary remote stderr or configurations.
+                logger.warning('Traffic snapshot unavailable on server %s protocol %s; baselines retained', sid, proto)
+    except Exception:
+        logger.warning('Traffic SSH unavailable on server %s; baselines retained', sid)
+    finally:
+        if ssh is not None:
+            try:
+                ssh.disconnect()
+            except Exception:
+                logger.warning('Traffic SSH disconnect failed on server %s', sid)
     return server_updates
 
 
