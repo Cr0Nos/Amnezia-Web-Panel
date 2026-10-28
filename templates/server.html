@@ -146,23 +146,72 @@
         color: var(--text-muted);
         font-size: 0.78rem;
     }
+    .ssh-trust-btn { display: inline-flex; align-items: center; gap: 7px; font-weight: 600; }
+    .ssh-trust-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--success); flex: 0 0 auto; }
+    .ssh-trust-btn.is-urgent { border-color: var(--warning); background: var(--warning-bg); color: var(--warning); }
+    .ssh-trust-dot.is-urgent { background: var(--warning); animation: sshTrustPulse 1.4s infinite; }
+    .ssh-trust-btn.is-danger { border-color: var(--danger); background: var(--danger-bg); color: var(--danger); font-weight: 700; box-shadow: 0 0 0 3px rgba(239, 68, 68, .12); }
+    .ssh-trust-dot.is-danger { background: var(--danger); animation: sshTrustPulse .9s infinite; }
+    .ssh-trust-dot.is-ok { background: var(--success); }
+    @keyframes sshTrustPulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .35; transform: scale(1.35); } }
 </style>
 {% endblock %}
 
 {% block content %}
 {% if current_user and current_user.role == 'admin' %}
-<section class="card" id="ssh-trust-panel" style="margin-bottom: 20px; padding: 20px;">
-    <h2>{{ _('ssh_trust_title') }}</h2>
-    <p>{{ _('ssh_trust_warning') }}</p>
-    <button class="btn btn-secondary" type="button" onclick="inspectSSHTrust()">{{ _('ssh_trust_inspect') }}</button>
-    <pre id="ssh-trust-details" aria-live="polite" style="white-space: pre-wrap; overflow-wrap: anywhere;"></pre>
-    <div id="ssh-trust-confirmation" hidden>
-        <label><input id="ssh-trust-verified" type="checkbox"> {{ _('ssh_trust_verified') }}</label>
-        <button id="ssh-trust-save" class="btn btn-primary" type="button" onclick="confirmSSHTrust()">{{ _('ssh_trust_save') }}</button>
+<div class="modal-backdrop" id="sshTrustModal">
+    <div class="modal" style="max-width: 560px;">
+        <div class="modal-header">
+            <h2 class="modal-title">{{ _('ssh_trust_title') }}</h2>
+            <button class="modal-close" type="button" onclick="closeModal('sshTrustModal')">×</button>
+        </div>
+        <div class="modal-body" id="ssh-trust-panel">
+            <p class="text-muted" style="margin-top: 0;">{{ _('ssh_trust_warning') }}</p>
+            <button class="btn btn-secondary" type="button" onclick="inspectSSHTrust()">{{ _('ssh_trust_inspect') }}</button>
+            <pre id="ssh-trust-details" aria-live="polite" style="white-space: pre-wrap; overflow-wrap: anywhere;"></pre>
+            <div id="ssh-trust-confirmation" hidden>
+                <label><input id="ssh-trust-verified" type="checkbox"> {{ _('ssh_trust_verified') }}</label>
+                <button id="ssh-trust-save" class="btn btn-primary" type="button" onclick="confirmSSHTrust()">{{ _('ssh_trust_save') }}</button>
+            </div>
+        </div>
     </div>
-</section>
+</div>
 <script>
     let sshTrustToken = null;
+    function setSSHTrustButton(state) {
+        const btn = document.getElementById('sshTrustBtn');
+        const text = document.getElementById('sshTrustBtnText');
+        const dot = document.getElementById('sshTrustDot');
+        if (!btn || !text || !dot) return;
+        btn.classList.remove('is-urgent', 'is-danger', 'is-ok');
+        dot.classList.remove('is-urgent', 'is-danger', 'is-ok');
+        if (state === 'changed') {
+            btn.classList.add('is-danger');
+            dot.classList.add('is-danger');
+            text.textContent = {{ _('ssh_trust_button_changed') | tojson }};
+        } else if (state === 'urgent') {
+            btn.classList.add('is-urgent');
+            dot.classList.add('is-urgent');
+            text.textContent = {{ _('ssh_trust_button_urgent') | tojson }};
+        } else {
+            btn.classList.add('is-ok');
+            dot.classList.add('is-ok');
+            text.textContent = {{ _('ssh_trust_button') | tojson }};
+        }
+    }
+
+    function openSSHTrustModal() {
+        openModal('sshTrustModal');
+    }
+
+    async function loadSSHTrustStatus() {
+        try {
+            const data = await apiCall('/api/servers/{{ server_id }}/ssh-trust/status?server_uid=' + encodeURIComponent({{ server.uid | tojson }}));
+            setSSHTrustButton(data.status === 'trusted' ? 'ok' : 'urgent');
+        } catch (error) {
+            setSSHTrustButton('urgent');
+        }
+    }
     async function inspectSSHTrust() {
         sshTrustToken = null;
         document.getElementById('ssh-trust-confirmation').hidden = true;
@@ -175,6 +224,9 @@
                 {{ _('ssh_trust_new') | tojson }} + ': ' + data.algorithm + ' ' + data.fingerprint + '\n' +
                 {{ _('ssh_trust_old') | tojson }} + ':\n' + data.old_fingerprints.map(k => k.algorithm + ' ' + k.fingerprint).join('\n');
             sshTrustToken = data.token;
+            if (data.status === 'changed') setSSHTrustButton('changed');
+            else if (data.status === 'trusted') setSSHTrustButton('ok');
+            else setSSHTrustButton('urgent');
             document.getElementById('ssh-trust-confirmation').hidden = data.status === 'trusted';
         } catch (error) { details.textContent = error.message; }
     }
@@ -191,6 +243,7 @@
             document.getElementById('ssh-trust-details').textContent = error.message;
         } finally { button.disabled = false; }
     }
+    document.addEventListener('DOMContentLoaded', loadSSHTrustStatus);
 </script>
 {% endif %}
 <a href="/" class="back-link page-back-link">{{ _('back_to_servers') }}</a>
@@ -209,6 +262,12 @@
         </div>
         <div class="page-header__actions">
             <div class="flex gap-sm items-center" id="serverStats" style="display:none;"></div>
+            {% if current_user and current_user.role == 'admin' %}
+            <button class="btn btn-sm ssh-trust-btn" type="button" id="sshTrustBtn" onclick="openSSHTrustModal()">
+                <span class="ssh-trust-dot" id="sshTrustDot"></span>
+                <span id="sshTrustBtnText">{{ _('ssh_trust_button') }}</span>
+            </button>
+            {% endif %}
             <button class="btn btn-secondary btn-sm" onclick="checkServer()" id="checkBtn">
                 <span id="checkBtnText">{{ _('server_check') }}</span>
                 <div class="spinner hidden" id="checkSpinner"></div>
