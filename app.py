@@ -3184,15 +3184,20 @@ def index(request: Request):
 
 
 @app.get('/server/{server_id}', response_class=HTMLResponse, tags=["System Templates"])
-def server_detail(request: Request, server_id: int):
+async def server_detail(request: Request, server_id: int):
     user = get_current_user(request)
     if not user:
         return RedirectResponse(url='/login', status_code=302)
     if user['role'] not in ('admin', 'support'):
         return RedirectResponse(url='/my', status_code=302)
-    data = load_data()
-    if server_id >= len(data['servers']):
-        return RedirectResponse(url='/')
+    async with DATA_LOCK:
+        data = load_data()
+        if server_id < 0 or server_id >= len(data['servers']):
+            return RedirectResponse(url='/')
+        # Startup normally migrates these. Also cover legacy state restored
+        # while running, before stamping an actionable UID into the page.
+        if backfill_server_uids(data['servers']):
+            save_data(data)
     server = data['servers'][server_id]
     users_list = data.get('users', [])
     return tpl(request, 'server.html', server=server, server_id=server_id, users=users_list)
@@ -3969,20 +3974,23 @@ def _rkn_record(server):
     return server.get('rknblock') or {}
 
 
-def _rkn_server_index(data, server_id, server_uid):
+def _rkn_server_index(data, server_id, server_uid, expected=None):
     """Resolve a server after a long SSH call: uid survives reorder/delete,
-    the positional index is only a fallback for legacy records."""
-    if server_uid is not None:
-        for idx, srv in enumerate(data.get('servers', [])):
-            if server_uid and srv.get('uid') == server_uid:
-                return idx
+    legacy index-only callers still need one persisted, unambiguous UID."""
+    servers = data.get('servers', [])
+    if server_uid is None and isinstance(server_id, int) and 0 <= server_id < len(servers):
+        server_uid = servers[server_id].get('uid')
+    matches = [idx for idx, srv in enumerate(servers) if server_uid and srv.get('uid') == server_uid]
+    if len(matches) != 1:
         return None
-    if isinstance(server_id, int) and 0 <= server_id < len(data.get('servers', [])):
-        return server_id
-    return None
+    idx = matches[0]
+    if expected is not None and any(servers[idx].get(k) != expected.get(k)
+                                   for k in ('uid', 'host', 'ssh_port', 'username', 'password', 'private_key')):
+        return None
+    return idx
 
 
-async def _rkn_store_record(server_id, server_uid, mutate):
+async def _rkn_store_record(server_id, server_uid, mutate, expected=None):
     """Reload under DATA_LOCK after SSH and persist only the RKN record.
 
     RKN install/enable/options take seconds and the old code saved a whole
@@ -3993,7 +4001,7 @@ async def _rkn_store_record(server_id, server_uid, mutate):
     """
     async with DATA_LOCK:
         data = load_data()
-        idx = _rkn_server_index(data, server_id, server_uid)
+        idx = _rkn_server_index(data, server_id, server_uid, expected)
         if idx is None:
             return None
         rec = dict(data['servers'][idx].get('rknblock') or {})
@@ -4003,10 +4011,10 @@ async def _rkn_store_record(server_id, server_uid, mutate):
         return rec
 
 
-async def _rkn_drop_record(server_id, server_uid):
+async def _rkn_drop_record(server_id, server_uid, expected=None):
     async with DATA_LOCK:
         data = load_data()
-        idx = _rkn_server_index(data, server_id, server_uid)
+        idx = _rkn_server_index(data, server_id, server_uid, expected)
         if idx is None:
             return False
         data['servers'][idx].pop('rknblock', None)
@@ -4016,14 +4024,18 @@ async def _rkn_drop_record(server_id, server_uid):
 
 async def _rkn_ssh_run(server, cmd, timeout):
     ssh = await asyncio.to_thread(get_ssh, server)
-    await asyncio.to_thread(ssh.connect)
     try:
+        await asyncio.to_thread(ssh.connect)
+        if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
         out, err, code = await asyncio.to_thread(ssh.run_sudo_command, cmd, timeout)
     finally:
         try:
             ssh.disconnect()
         except Exception:
             pass
+    if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
+        return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
     if code != 0:
         return JSONResponse({'error': f'command failed: {(err or out or "").strip()[-500:]}'},
                             status_code=500)
@@ -4031,6 +4043,7 @@ async def _rkn_ssh_run(server, cmd, timeout):
 
 
 @app.post('/api/servers/{server_id}/rknblock/install', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_rknblock_install(request: Request, server_id: int, server_uid: str | None = None):
     """Install the RKN/VK network blocking app (rkn-extra-block contour)."""
     if not _check_admin(request):
@@ -4039,7 +4052,9 @@ async def api_rknblock_install(request: Request, server_id: int, server_uid: str
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
+    server = dict(data['servers'][server_id])
+    if _rkn_record(server).get('installed'):
+        return JSONResponse({'error': 'App is already installed; refresh its status'}, status_code=409)
     server_uid = server.get('uid')
     err = await _rkn_ssh_run(server, RKN_INSTALL_CMD, 420)
     if err is not None:
@@ -4050,7 +4065,7 @@ async def api_rknblock_install(request: Request, server_id: int, server_uid: str
         rec['enabled'] = True
         rec['last_error'] = None
 
-    rec = await _rkn_store_record(server_id, server_uid, mark)
+    rec = await _rkn_store_record(server_id, server_uid, mark, server)
     if rec is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     RKN_FLAG_CACHE.clear()
@@ -4058,6 +4073,7 @@ async def api_rknblock_install(request: Request, server_id: int, server_uid: str
 
 
 @app.post('/api/servers/{server_id}/rknblock/uninstall', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_rknblock_uninstall(request: Request, server_id: int, server_uid: str | None = None):
     """Fully remove the blocking contour: rules, sets, units, scripts, logs."""
     if not _check_admin(request):
@@ -4066,12 +4082,12 @@ async def api_rknblock_uninstall(request: Request, server_id: int, server_uid: s
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
+    server = dict(data['servers'][server_id])
     server_uid = server.get('uid')
     err = await _rkn_ssh_run(server, _rkn_run_cmd('uninstall'), 180)
     if err is not None:
         return err
-    if not await _rkn_drop_record(server_id, server_uid):
+    if not await _rkn_drop_record(server_id, server_uid, server):
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     RKN_FLAG_CACHE.clear()
     return {'status': 'success', 'installed': False}
@@ -4082,6 +4098,7 @@ class RknBlockEnableRequest(BaseModel):
 
 
 @app.post('/api/servers/{server_id}/rknblock/enable', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEnableRequest, server_uid: str | None = None):
     """Start or stop the blocking contour (rules jump in/out; lists stay)."""
     if not _check_admin(request):
@@ -4090,7 +4107,7 @@ async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEna
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
+    server = dict(data['servers'][server_id])
     if not _rkn_record(server).get('installed'):
         return JSONResponse({'error': 'App is not installed'}, status_code=409)
     server_uid = server.get('uid')
@@ -4103,7 +4120,7 @@ async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEna
         rec['enabled'] = bool(req.enabled)
         rec['last_error'] = None
 
-    rec = await _rkn_store_record(server_id, server_uid, mark)
+    rec = await _rkn_store_record(server_id, server_uid, mark, server)
     if rec is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     RKN_FLAG_CACHE.clear()
@@ -4111,6 +4128,7 @@ async def api_rknblock_enable(request: Request, server_id: int, req: RknBlockEna
 
 
 @app.post('/api/servers/{server_id}/rknblock/update', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_rknblock_update(request: Request, server_id: int, server_uid: str | None = None):
     """Re-download the C24Be lists and atomically reload the ipset sets."""
     if not _check_admin(request):
@@ -4119,7 +4137,7 @@ async def api_rknblock_update(request: Request, server_id: int, server_uid: str 
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
+    server = dict(data['servers'][server_id])
     if not _rkn_record(server).get('installed'):
         return JSONResponse({'error': 'App is not installed'}, status_code=409)
     err = await _rkn_ssh_run(server, _rkn_run_cmd('update'), 300)
@@ -4140,6 +4158,7 @@ class RknBlockOptionsRequest(BaseModel):
 
 
 @app.post('/api/servers/{server_id}/rknblock/options', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOptionsRequest, server_uid: str | None = None):
     """Set per-direction block/log flags on the host contour (chains rebuilt only)."""
     if not _check_admin(request):
@@ -4148,7 +4167,7 @@ async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOp
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
+    server = dict(data['servers'][server_id])
     if not _rkn_record(server).get('installed'):
         return JSONResponse({'error': 'App is not installed'}, status_code=409)
     values = req.model_dump()
@@ -4163,7 +4182,7 @@ async def api_rknblock_options(request: Request, server_id: int, req: RknBlockOp
         rec['flags'] = values
         rec['last_error'] = None
 
-    rec = await _rkn_store_record(server_id, server_uid, mark)
+    rec = await _rkn_store_record(server_id, server_uid, mark, server)
     if rec is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
     RKN_FLAG_CACHE.clear()
@@ -4272,8 +4291,10 @@ def _parse_rkn_scan_output(out, flag_enabled):
 async def _fetch_rkn_scan_output(server):
     """SSH to a server and fetch the rkn-extra-block status line + scan log tail."""
     ssh = await asyncio.to_thread(get_ssh, server)
-    await asyncio.to_thread(ssh.connect)
     try:
+        await asyncio.to_thread(ssh.connect)
+        if _rkn_server_index(load_data(), None, server.get('uid'), server) is None:
+            raise ValueError('Server identity changed')
         out, _, _ = await asyncio.to_thread(ssh.run_sudo_command, RKN_SCAN_SSH_CMD, 60)
     finally:
         try:
@@ -4292,7 +4313,7 @@ async def api_rkn_scans(request: Request, server_id: int, server_uid: str | None
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
+    server = dict(data['servers'][server_id])
     identity = [server.get(k) for k in ('uid', 'host', 'ssh_port', 'username')]
     previous_record = dict(server.get('rknblock') or {})
     available = True
@@ -4328,6 +4349,7 @@ async def api_rkn_scans(request: Request, server_id: int, server_uid: str | None
 
 
 @app.post('/api/servers/{server_id}/rkn_scans/clear', tags=["Servers"])
+@serialize_peer_lifecycle
 async def api_rkn_scans_clear(request: Request, server_id: int, server_uid: str | None = None):
     """Truncate the remote rkn-scans.json so the admin can acknowledge sightings."""
     if not _check_admin(request):
@@ -4336,20 +4358,11 @@ async def api_rkn_scans_clear(request: Request, server_id: int, server_uid: str 
     server_id = _rkn_server_index(data, server_id, server_uid)
     if server_id is None:
         return JSONResponse({'error': 'Server not found'}, status_code=404)
-    server = data['servers'][server_id]
-    ssh = await asyncio.to_thread(get_ssh, server)
-    await asyncio.to_thread(ssh.connect)
-    try:
-        # Новые версии: переносят горизонт сбора (старое не подхватится агентом).
-        # Старые: просто обнулят файл — событие вернётся после часового прогона агента.
-        await asyncio.to_thread(
-            ssh.run_sudo_command,
-            'rkn-extra-block clearscans 2>/dev/null || : > /var/log/rkn-scans.json', 30)
-    finally:
-        try:
-            ssh.disconnect()
-        except Exception:
-            pass
+    server = dict(data['servers'][server_id])
+    error = await _rkn_ssh_run(server,
+        'rkn-extra-block clearscans 2>/dev/null || : > /var/log/rkn-scans.json', 30)
+    if error is not None:
+        return error
     RKN_FLAG_CACHE.pop(server_id, None)
     return {'status': 'cleared'}
 
