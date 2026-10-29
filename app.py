@@ -5661,15 +5661,17 @@ def api_container_toggle(request: Request, server_id: int, req: ContainerToggleR
 
 
 @app.post('/api/servers/{server_id}/server_config', tags=["Protocols"])
-def api_server_config(request: Request, server_id: int, req: ProtocolRequest):
+def api_server_config(request: Request, server_id: int, req: ProtocolRequest, server_uid: str | None = None):
     """Get the raw server-side WireGuard/Xray configuration."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
         data = load_data()
-        if server_id >= len(data['servers']):
+        if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
+        if server_uid is not None and server.get('uid') != server_uid:
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
         ssh = get_ssh(server)
         ssh.connect()
         if protocol_base(req.protocol) == 'xray':
@@ -6225,20 +6227,109 @@ def api_wgeasy_import(request: Request, server_id: int, req: WgEasyImportRequest
 
 @app.post('/api/servers/{server_id}/server_config/save', tags=["Protocols"])
 @serialize_peer_lifecycle
-def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
+def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest, server_uid: str | None = None):
     """Save the raw server-side WireGuard/Xray configuration and apply changes."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
     try:
         data = load_data()
         if server_id < 0 or server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         guard = _traffic_removal_guard(data, server_id=server_id, protocol=req.protocol, include_archived=True)
-        if guard is not None:
-            return guard
         server = data['servers'][server_id]
+        if server_uid is not None and server.get('uid') != server_uid:
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+        base = protocol_base(req.protocol)
+        from peer_accounting import _protocol_scope
+        scope = _protocol_scope(req.protocol)
+        protected = guard is not None or any(info.get('exit_link') for key, info in server.get('protocols', {}).items()
+                                              if _protocol_scope(key) == scope)
+        def parsed(content):
+            # Compare parsed values, never an edited text with peers/commands
+            # stripped out. A no-op needs no write, reload or counter reset.
+            if base == 'xray':
+                def unique(pairs):
+                    value = {}
+                    for key, item in pairs:
+                        if key in value:
+                            raise ValueError('Duplicate JSON key')
+                        value[key] = item
+                    return value
+                value = json.loads(content, object_pairs_hook=unique)
+                if not isinstance(value, dict) or not value:
+                    raise ValueError('Invalid JSON configuration')
+            elif base == 'telemt':
+                import tomllib
+                value = tomllib.loads(content)
+                if not value:
+                    raise ValueError('Invalid TOML configuration')
+            elif base in AWG_PROTOCOLS or base == 'wireguard':
+                value = []
+                for line in content.splitlines():
+                    line = line.strip()
+                    if line.startswith('#') and re.match(r'^#\s*DNS\s*=', line):
+                        line = line.lstrip('#').strip()  # Client defaults are meaningful too.
+                    elif not line or line.startswith('#'):
+                        continue
+                    if line in ('[Interface]', '[Peer]'):
+                        value.append([line, {}])
+                    else:
+                        if not value or '=' not in line:
+                            raise ValueError('Invalid WireGuard configuration')
+                        key, item = (s.strip() for s in line.split('=', 1))
+                        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9]*', key) or not item:
+                            raise ValueError('Invalid WireGuard setting')
+                        value[-1][1].setdefault(key, []).append(item)
+                if (not value or value[0][0] != '[Interface]'
+                        or sum(section == '[Interface]' for section, _ in value) != 1
+                        or len(value[0][1].get('PrivateKey', [])) != 1
+                        or any(len(fields.get('PublicKey', [])) != 1 for section, fields in value[1:])):
+                    raise ValueError('Incomplete WireGuard configuration')
+            else:
+                raise ValueError('No safe comparison for this protocol')
+            return json.dumps(value, sort_keys=True, allow_nan=False, separators=(',', ':'))
+
+        if protected:
+            try:
+                proposed = parsed(req.config)
+            except (ValueError, TypeError):
+                return JSONResponse({'error': 'Invalid or ambiguous configuration; accounted peers and exit links were not changed.',
+                                     'code': 'traffic_finalization_required'}, status_code=409)
         ssh = get_ssh(server)
         ssh.connect()
+        # Lifecycle serialization excludes cooperating peer/inventory writes.
+        # Recheck current identity/ownership after the potentially slow connect.
+        current = load_data()
+        if (server_id >= len(current['servers']) or
+                traffic_server_identity(current['servers'][server_id]) != traffic_server_identity(server)):
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+        current_guard = _traffic_removal_guard(current, server_id=server_id, protocol=req.protocol, include_archived=True)
+        if not protected and current_guard is not None:
+            return current_guard
+        if not protected and any(info.get('exit_link') for key, info in current['servers'][server_id].get('protocols', {}).items()
+                                 if _protocol_scope(key) == scope):
+            return JSONResponse({'error': 'Exit link changed; refresh the configuration'}, status_code=409)
+        if protected:
+            mgr = get_protocol_manager(ssh, req.protocol)
+            if base == 'xray':
+                actual = json.dumps(mgr._get_server_json(), allow_nan=False)
+            elif base in ('wireguard', 'telemt'):
+                actual = mgr._get_server_config()
+            else:
+                actual = mgr._get_server_config(req.protocol)
+            latest = load_data()
+            if (server_id >= len(latest['servers']) or
+                    traffic_server_identity(latest['servers'][server_id]) != traffic_server_identity(server)):
+                return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+            try:
+                unchanged = parsed(actual) == proposed
+            except (ValueError, TypeError):
+                unchanged = False
+            if unchanged:
+                return {'status': 'success', 'unchanged': True}
+            return JSONResponse({'error': 'Applying this configuration may restart the protocol and reset peer counters. A counter-preserving apply procedure is required.',
+                                 'code': 'traffic_finalization_required'}, status_code=409)
         if protocol_base(req.protocol) == 'xray':
             from managers.xray_manager import XrayManager
             mgr = XrayManager(ssh, req.protocol)
@@ -6246,7 +6337,6 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
             try:
                 data_json = _json.loads(req.config)
             except Exception as e:
-                ssh.disconnect()
                 return JSONResponse({'error': f'Invalid JSON format: {str(e)}'}, status_code=400)
             mgr._save_server_json(data_json)
         elif protocol_base(req.protocol) == 'telemt':
@@ -6264,11 +6354,16 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         else:
             mgr = AWGManager(ssh)
             mgr.save_server_config(req.protocol, req.config)
-        ssh.disconnect()
         return {'status': 'success'}
     except Exception as e:
         logger.exception("Error saving server config")
         return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh is not None:
+            try:
+                ssh.disconnect()
+            except Exception:
+                logger.warning('Config session disconnect failed')
 
 
 
