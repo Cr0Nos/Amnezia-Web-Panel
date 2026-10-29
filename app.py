@@ -5661,10 +5661,12 @@ def api_container_toggle(request: Request, server_id: int, req: ContainerToggleR
 
 
 @app.post('/api/servers/{server_id}/server_config', tags=["Protocols"])
+@serialize_peer_lifecycle
 def api_server_config(request: Request, server_id: int, req: ProtocolRequest, server_uid: str | None = None):
     """Get the raw server-side WireGuard/Xray configuration."""
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    ssh = None
     try:
         data = load_data()
         if server_id < 0 or server_id >= len(data['servers']):
@@ -5674,6 +5676,10 @@ def api_server_config(request: Request, server_id: int, req: ProtocolRequest, se
             return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
         ssh = get_ssh(server)
         ssh.connect()
+        current = load_data()
+        if (server_id >= len(current['servers']) or
+                traffic_server_identity(current['servers'][server_id]) != traffic_server_identity(server)):
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
         if protocol_base(req.protocol) == 'xray':
             from managers.xray_manager import XrayManager
             mgr = XrayManager(ssh, req.protocol)
@@ -5695,11 +5701,20 @@ def api_server_config(request: Request, server_id: int, req: ProtocolRequest, se
         else:
             mgr = AWGManager(ssh)
             config = mgr._get_server_config(req.protocol)
-        ssh.disconnect()
+        latest = load_data()
+        if (server_id >= len(latest['servers']) or
+                traffic_server_identity(latest['servers'][server_id]) != traffic_server_identity(server)):
+            return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
         return {'config': config}
     except Exception as e:
         logger.exception("Error getting server config")
         return JSONResponse({'error': str(e)}, status_code=500)
+    finally:
+        if ssh is not None:
+            try:
+                ssh.disconnect()
+            except Exception:
+                logger.warning('Config session disconnect failed')
 
 
 @app.post('/api/servers/{server_id}/ssh_cooldown', tags=["Servers"])
@@ -6243,6 +6258,19 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         base = protocol_base(req.protocol)
         from peer_accounting import _protocol_scope
         scope = _protocol_scope(req.protocol)
+        def ownership(state):
+            # Ignore live traffic deltas, but not replacement owners/peers,
+            # archived receipts or changes to the protected routing scope.
+            return (
+                [(c.get('id'), c.get('user_id'), c.get('client_id'), c.get('protocol'))
+                 for c in state.get('user_connections', [])
+                 if c.get('server_id') == server_id and _protocol_scope(c.get('protocol')) == scope],
+                [r for r in state.get('accounting_recoveries', [])
+                 if r['scope']['server_uid'] == server.get('uid')
+                 and _protocol_scope(r['connection'].get('protocol')) == scope],
+                [(key, info.get('exit_link')) for key, info in state['servers'][server_id].get('protocols', {}).items()
+                 if _protocol_scope(key) == scope])
+        original_ownership = ownership(data)
         protected = guard is not None or any(info.get('exit_link') for key, info in server.get('protocols', {}).items()
                                               if _protocol_scope(key) == scope)
         def parsed(content):
@@ -6304,6 +6332,9 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         if (server_id >= len(current['servers']) or
                 traffic_server_identity(current['servers'][server_id]) != traffic_server_identity(server)):
             return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+        if ownership(current) != original_ownership:
+            return JSONResponse({'error': 'Accounting ownership or exit link changed; refresh the configuration',
+                                 'code': 'traffic_finalization_required'}, status_code=409)
         current_guard = _traffic_removal_guard(current, server_id=server_id, protocol=req.protocol, include_archived=True)
         if not protected and current_guard is not None:
             return current_guard
@@ -6313,7 +6344,12 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
         if protected:
             mgr = get_protocol_manager(ssh, req.protocol)
             if base == 'xray':
-                actual = json.dumps(mgr._get_server_json(), allow_nan=False)
+                # Read the running container's raw JSON: the manager's parsed
+                # getter collapses duplicate keys and may fall back to a host copy.
+                actual, _, code = ssh.run_sudo_command(
+                    f'docker exec {shlex.quote(mgr.container_name)} cat {shlex.quote(mgr._config_path())}')
+                if code != 0:
+                    actual = ''
             elif base in ('wireguard', 'telemt'):
                 actual = mgr._get_server_config()
             else:
@@ -6322,6 +6358,9 @@ def api_server_config_save(request: Request, server_id: int, req: ServerConfigSa
             if (server_id >= len(latest['servers']) or
                     traffic_server_identity(latest['servers'][server_id]) != traffic_server_identity(server)):
                 return JSONResponse({'error': 'Server identity changed; refresh the inventory'}, status_code=409)
+            if ownership(latest) != original_ownership:
+                return JSONResponse({'error': 'Accounting ownership or exit link changed; refresh the configuration',
+                                     'code': 'traffic_finalization_required'}, status_code=409)
             try:
                 unchanged = parsed(actual) == proposed
             except (ValueError, TypeError):
