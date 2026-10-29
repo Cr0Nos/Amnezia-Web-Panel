@@ -9,7 +9,7 @@ from unittest.mock import Mock
 
 from fastapi.responses import JSONResponse
 
-FUNCTIONS = {'_parse_rkn_scan_output', 'api_rkn_scan_flags', 'api_rkn_scans',
+FUNCTIONS = {'_rkn_server_index', '_parse_rkn_scan_output', 'api_rkn_scan_flags', 'api_rkn_scans',
              'api_rkn_scans_clear'}
 
 

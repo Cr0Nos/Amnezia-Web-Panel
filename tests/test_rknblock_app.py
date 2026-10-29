@@ -124,6 +124,21 @@ class InstallTests(SshCase):
         self.assertEqual(resp.status_code, 403)
         self.assertEqual(self.ran, [])
 
+    def test_missing_uid_never_falls_back_to_reused_index(self):
+        self.server['uid'] = 'removed'
+        fresh = {'servers': [{'uid': 'other', 'rknblock': {'installed': False}}]}
+        self.panel['load_data'].side_effect = [{'servers': [self.server]}, fresh]
+        response = self.call()
+        self.assertEqual(fresh['servers'][0]['rknblock'], {'installed': False})
+        self.assertEqual(response.status_code, 404)
+        self.panel['save_data'].assert_not_called()
+
+    def test_request_uid_is_checked_before_ssh(self):
+        self.server['uid'] = 'other'
+        response = self.panel['asyncio'].run(self.panel['api_rknblock_install'](self.request, 0, 'missing'))
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(self.ran, [])
+
 
 class UninstallTests(SshCase):
     def call(self):
@@ -199,13 +214,14 @@ class UpdateTests(SshCase):
 class ScansResponseTests(unittest.TestCase):
     """api_rkn_scans exposes installed/enabled plus live running/healthy flags."""
 
-    def _run(self, parsed, record):
+    def _run(self, parsed, record, unavailable=False):
         path = Path(__file__).resolve().parents[1] / 'app.py'
         tree = ast.parse(path.read_text(encoding='utf-8'))
         nodes = [n for n in tree.body
-                 if isinstance(n, ast.AsyncFunctionDef) and n.name == 'api_rkn_scans']
-        assert len(nodes) == 1
-        nodes[0].decorator_list = []
+                 if isinstance(n, (ast.AsyncFunctionDef, ast.FunctionDef)) and n.name in ('api_rkn_scans', '_rkn_server_index')]
+        assert len(nodes) == 2
+        for node in nodes:
+            node.decorator_list = []
         namespace = {
             'Request': object, 'JSONResponse': JSONResponse, 'logger': Mock(),
             'load_data': Mock(), '_check_admin': Mock(return_value=True),
@@ -214,7 +230,9 @@ class ScansResponseTests(unittest.TestCase):
         }
 
         async def fake_fetch(server):
-            return ''
+            if unavailable:
+                raise OSError('synthetic SSH outage')
+            return '===LOG==='  # Complete probe envelope, even for an empty scan log.
 
         namespace['_fetch_rkn_scan_output'] = fake_fetch
         exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), 'exec'), namespace)
@@ -255,6 +273,16 @@ class ScansResponseTests(unittest.TestCase):
         self.assertFalse(result['healthy'])
         self.assertIn('lists_empty', result['problems'])
         self.assertIn('health_failed', result['problems'])
+
+    def test_ssh_outage_preserves_installed_record(self):
+        result = self._run({'agent_state': 'unknown'}, {'installed': True, 'enabled': True}, unavailable=True)
+        self.assertTrue(result['installed'])
+        self.assertFalse(result['available'])
+        self.assertFalse(result['running'])
+
+    def test_live_installation_is_not_offered_for_install_again(self):
+        result = self._run({'agent_state': 'on', 'sets_ok': True, 'health': 'ok'}, {})
+        self.assertTrue(result['installed'])
 
 
 if __name__ == '__main__':
