@@ -483,9 +483,24 @@ class PublicPortForwardTests(PublicEndpointApiTests):
         client = self.client(); ssh = self.ssh_recorder()
         with mock.patch.object(panel, 'get_ssh', return_value=ssh):
             self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9', public_port='8443')
-            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9', public_port='')
+            with mock.patch.object(panel.socket, 'getaddrinfo', side_effect=OSError('unknown host')):
+                res = self.set_endpoint(client, protocol='awg2', public_host='unresolved.invalid', public_port='')
         self.assertEqual(res.json()['warning'], '')
         self.assertFalse(ssh.nf.prerouting[4])
+
+    def test_repeated_clear_retries_failed_cleanup_after_setting_is_gone(self):
+        client = self.client(); ssh = self.ssh_recorder()
+        with mock.patch.object(panel, 'get_ssh', return_value=ssh):
+            self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9', public_port='8443')
+            ssh.nf.fail = lambda a: '-D' in a
+            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9', public_port='')
+            self.assertTrue(res.json()['warning'])
+            self.assertNotIn('public_port', self.stored('awg2'))
+            self.assertTrue(ssh.nf.prerouting[4])
+            ssh.nf.fail = None
+            res = self.set_endpoint(client, protocol='awg2', public_host='203.0.113.9', public_port='')
+            self.assertEqual(res.json()['warning'], '')
+            self.assertFalse(ssh.nf.prerouting[4])
 
     def test_unresolved_domain_warns_without_applying_any_rule(self):
         client = self.client(); ssh = self.ssh_recorder()

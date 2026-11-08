@@ -6809,6 +6809,7 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
         ssh = None
         try:
             base = protocol_base(proto)
+            needs_forward_sync = any(base in protocols for protocols in PUBLIC_FORWARD_L4.values())
             if base == 'telemt':
                 pub_host, pub_port = protocol_public_endpoint(server, proto)
                 ssh = await asyncio.to_thread(get_ssh, server)
@@ -6816,12 +6817,12 @@ async def api_set_protocol_public_endpoint(request: Request, server_id: int, req
                 manager = get_protocol_manager(ssh, proto)
                 await asyncio.to_thread(
                     manager.set_public_endpoint, pub_host, pub_port or record.get('port', '443'))
-            will_forward = bool(port and str(port) != str(listen_port))
-            will_drop = bool(old_public_port and str(old_public_port) != str(port))
-            if ssh is None and (will_forward or will_drop):
+            # A previous cleanup may have failed after the override was saved.
+            # Repeated clears must still reconcile the stable ownership marker.
+            if ssh is None and needs_forward_sync:
                 ssh = await asyncio.to_thread(get_ssh, server)
                 await asyncio.to_thread(ssh.connect)
-            if ssh is not None and (will_forward or will_drop):
+            if ssh is not None and needs_forward_sync:
                 warning = await asyncio.to_thread(
                     _apply_public_port_forward, ssh, server, proto, port, listen_port, old_public_port)
         except Exception as e:
@@ -6960,8 +6961,6 @@ def public_port_forward_commands(protocol, public_port, listen_port, old_public_
     l4 = next((k for k, v in PUBLIC_FORWARD_L4.items() if base in v), None)
     if l4 is None:
         return None, ''
-    if not public_port and not old_public_port:
-        return None, ''
     try:
         listen_port = public_port_forward.port(listen_port)
         if public_port:
@@ -6972,7 +6971,9 @@ def public_port_forward_commands(protocol, public_port, listen_port, old_public_
             raise ValueError('missing stable server UID; forward unchanged')
     except ValueError as e:
         return None, str(e)
-    fam, warning = _forward_family_dests(public_ip)
+    # Deleting our marker needs neither Docker discovery nor working DNS.
+    fam, warning = (_forward_family_dests(public_ip) if public_port and public_port != listen_port
+                    else ({4: [], 6: []}, ''))
     if warning:
         return None, warning
     request = {'protocol': protocol, 'container': protocol_container_name(protocol),

@@ -297,6 +297,9 @@ class NamespaceDnatTests(unittest.TestCase):
         """
         host = int(os.environ['PUBLIC_FORWARD_LAB_HOST_NETNS'])
         self.assertNotEqual(os.stat('/proc/self/ns/net').st_ino, host)
+        self.assertNotEqual(os.stat('/proc/self/ns/net').st_ino,
+                            os.stat('/proc/1/ns/net').st_ino,
+                            'refusing to mutate the init network namespace')
         children = []
         def command(argv, **kw):
             self.assertNotEqual(os.stat('/proc/self/ns/net').st_ino, host)
