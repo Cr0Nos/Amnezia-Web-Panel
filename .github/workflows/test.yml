@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.11', '3.13']
 
@@ -45,9 +46,6 @@ jobs:
             if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():raise SystemExit(1)
         PY
 
-    - name: Run unit tests
-      run: python -m unittest discover -s tests -v
-
     - name: Verify backup and peer regressions as root with isolated state
       run: |
         sudo "$(command -v python)" - <<'PY'
@@ -64,3 +62,7 @@ jobs:
             if not result.wasSuccessful():
                 raise SystemExit(1)
         PY
+
+    - name: Run unit tests
+      run: python -m unittest discover -s tests -v
+
