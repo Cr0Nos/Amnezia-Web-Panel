@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.11', '3.13']
 
@@ -32,6 +33,10 @@ jobs:
 
     - name: Install Chromium for UI regression tests
       run: python -m playwright install --with-deps chromium
+
+    - name: Reproduce server-header and RKN fixture failures before changes
+      run: |
+        python -m unittest -v tests.test_ipv6_ui_fixes.TestC5Styles.test_server_ip_chips_stack_without_resizing_header_actions tests.test_marketplace_dispatch.MarketplaceBrowserTests.test_rkn_card_reload_outage_recovery_and_request_races
 
     - name: Run unit tests
       run: python -m unittest discover -s tests -v
