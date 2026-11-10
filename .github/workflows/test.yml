@@ -33,6 +33,39 @@ jobs:
     - name: Install Chromium for UI regression tests
       run: python -m playwright install --with-deps chromium
 
+    - name: Confirm current main baseline reproductions
+      run: python validation-dnat-before.py
+
+    - name: Public endpoint and SSH targeted regressions
+      run: |
+        python - <<'PY'
+        import os,tempfile,unittest
+        with tempfile.TemporaryDirectory(prefix='dnat-target-') as state:
+            os.environ.update(DATA_FILE=state+'/data.json',SSH_KNOWN_HOSTS_FILE=state+'/known_hosts',TUNNEL_STATE_FILE=state+'/tunnels.json',SECRET_KEY='isolated-ci-fixture')
+            suite=unittest.TestSuite()
+            for pattern in ('test_public_endpoint.py','test_public_endpoint_dnat.py','test_ssh_transport_race.py'):
+                suite.addTests(unittest.defaultTestLoader.discover('tests',pattern=pattern))
+            if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():raise SystemExit(1)
+        PY
+
+    - name: Real netfilter and nonroot sudo in isolated network namespaces
+      run: |
+        command -v unshare nsenter ip iptables ip6tables
+        host_netns=$(stat -Lc %i /proc/self/ns/net)
+        sudo iptables-save | sed '/^#/d' > /tmp/dnat-host-v4-before
+        sudo ip6tables-save | sed '/^#/d' > /tmp/dnat-host-v6-before
+        ip -j route show table all > /tmp/dnat-routes-before
+        ip -j rule > /tmp/dnat-rules-before
+        sudo env PUBLIC_FORWARD_LAB_HOST_NETNS="$host_netns" PUBLIC_FORWARD_LAB_NONROOT_UID="$(id -u)" unshare --net --mount --propagation private "$(command -v python)" -m unittest tests.test_public_endpoint_dnat.NamespaceDnatTests -v
+        sudo iptables-save | sed '/^#/d' > /tmp/dnat-host-v4-after
+        sudo ip6tables-save | sed '/^#/d' > /tmp/dnat-host-v6-after
+        ip -j route show table all > /tmp/dnat-routes-after
+        ip -j rule > /tmp/dnat-rules-after
+        diff -u /tmp/dnat-host-v4-before /tmp/dnat-host-v4-after
+        diff -u /tmp/dnat-host-v6-before /tmp/dnat-host-v6-after
+        diff -u /tmp/dnat-routes-before /tmp/dnat-routes-after
+        diff -u /tmp/dnat-rules-before /tmp/dnat-rules-after
+
     - name: Run unit tests
       run: python -m unittest discover -s tests -v
 
@@ -46,7 +79,7 @@ jobs:
                               TUNNEL_STATE_FILE=state + '/tunnels.json',
                               SECRET_KEY='isolated-ci-fixture')
             suite = unittest.defaultTestLoader.discover('tests', pattern='test_panel_backup.py')
-            for pattern in ('test_rknblock_app.py', 'test_server_page_render.py', 'test_destructive_accounting_guards.py'):
+            for pattern in ('test_rknblock_app.py', 'test_server_page_render.py', 'test_destructive_accounting_guards.py', 'test_public_endpoint.py', 'test_public_endpoint_dnat.py', 'test_ssh_transport_race.py'):
                 suite.addTests(unittest.defaultTestLoader.discover('tests', pattern=pattern))
             result = unittest.TextTestRunner(verbosity=2).run(suite)
             if not result.wasSuccessful():
