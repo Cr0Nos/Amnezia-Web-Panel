@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.11', '3.13']
 
@@ -32,6 +33,17 @@ jobs:
 
     - name: Install Chromium for UI regression tests
       run: python -m playwright install --with-deps chromium
+
+    - name: Server header and marketplace targeted tests including real Chromium
+      run: |
+        python - <<'PY'
+        import unittest
+        suite=unittest.TestSuite()
+        for pattern in ('test_ipv6_ui_fixes.py','test_ipv6_ui_browser.py','test_marketplace_dispatch.py','test_server_template_integrity.py'):
+            suite.addTests(unittest.defaultTestLoader.discover('tests',pattern=pattern))
+        result=unittest.TextTestRunner(verbosity=2).run(suite)
+        if not result.wasSuccessful() or result.skipped:raise SystemExit(1)
+        PY
 
     - name: Run unit tests
       run: python -m unittest discover -s tests -v
