@@ -53,19 +53,20 @@ jobs:
       run: |
         command -v unshare nsenter ip iptables ip6tables
         host_netns=$(stat -Lc %i /proc/self/ns/net)
-        sudo iptables-save | sed '/^#/d' > /tmp/dnat-host-v4-before
-        sudo ip6tables-save | sed '/^#/d' > /tmp/dnat-host-v6-before
+        sudo iptables-save | sed -E '/^#/d;s/\[[0-9]+:[0-9]+\]/[counter]/g' > /tmp/dnat-host-v4-before
+        sudo ip6tables-save | sed -E '/^#/d;s/\[[0-9]+:[0-9]+\]/[counter]/g' > /tmp/dnat-host-v6-before
         ip -j route show table all > /tmp/dnat-routes-before
         ip -j rule > /tmp/dnat-rules-before
         sudo env PUBLIC_FORWARD_LAB_HOST_NETNS="$host_netns" PUBLIC_FORWARD_LAB_NONROOT_UID="$(id -u)" unshare --net --mount --propagation private "$(command -v python)" -m unittest tests.test_public_endpoint_dnat.NamespaceDnatTests -v
-        sudo iptables-save | sed '/^#/d' > /tmp/dnat-host-v4-after
-        sudo ip6tables-save | sed '/^#/d' > /tmp/dnat-host-v6-after
+        sudo iptables-save | sed -E '/^#/d;s/\[[0-9]+:[0-9]+\]/[counter]/g' > /tmp/dnat-host-v4-after
+        sudo ip6tables-save | sed -E '/^#/d;s/\[[0-9]+:[0-9]+\]/[counter]/g' > /tmp/dnat-host-v6-after
         ip -j route show table all > /tmp/dnat-routes-after
         ip -j rule > /tmp/dnat-rules-after
         diff -u /tmp/dnat-host-v4-before /tmp/dnat-host-v4-after
         diff -u /tmp/dnat-host-v6-before /tmp/dnat-host-v6-after
         diff -u /tmp/dnat-routes-before /tmp/dnat-routes-after
         diff -u /tmp/dnat-rules-before /tmp/dnat-rules-after
+        echo DNAT_HOST_RULES_ROUTES_UNCHANGED=YES
 
     - name: Verify backup and peer regressions as root with isolated state
       run: |
