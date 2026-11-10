@@ -33,6 +33,18 @@ jobs:
     - name: Install Chromium for UI regression tests
       run: python -m playwright install --with-deps chromium
 
+    - name: Telemt and AWG lifecycle targeted regressions
+      run: |
+        python - <<'PY'
+        import os,tempfile,unittest
+        with tempfile.TemporaryDirectory(prefix='telemt-target-') as state:
+            os.environ.update(DATA_FILE=state+'/data.json',SSH_KNOWN_HOSTS_FILE=state+'/known_hosts',TUNNEL_STATE_FILE=state+'/tunnels.json',SECRET_KEY='isolated-ci-fixture')
+            suite=unittest.TestSuite()
+            for pattern in ('test_peer_create_lifecycle.py','test_telemt_manager.py','test_warp_client_ctx.py'):
+                suite.addTests(unittest.defaultTestLoader.discover('tests',pattern=pattern))
+            if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():raise SystemExit(1)
+        PY
+
     - name: Run unit tests
       run: python -m unittest discover -s tests -v
 
@@ -46,7 +58,7 @@ jobs:
                               TUNNEL_STATE_FILE=state + '/tunnels.json',
                               SECRET_KEY='isolated-ci-fixture')
             suite = unittest.defaultTestLoader.discover('tests', pattern='test_panel_backup.py')
-            for pattern in ('test_rknblock_app.py', 'test_server_page_render.py', 'test_destructive_accounting_guards.py'):
+            for pattern in ('test_rknblock_app.py', 'test_server_page_render.py', 'test_destructive_accounting_guards.py', 'test_peer_create_lifecycle.py', 'test_telemt_manager.py', 'test_warp_client_ctx.py'):
                 suite.addTests(unittest.defaultTestLoader.discover('tests', pattern=pattern))
             result = unittest.TextTestRunner(verbosity=2).run(suite)
             if not result.wasSuccessful():
