@@ -14,6 +14,7 @@ jobs:
     runs-on: ubuntu-latest
 
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.11', '3.13']
 
@@ -32,6 +33,20 @@ jobs:
 
     - name: Install Chromium for UI regression tests
       run: python -m playwright install --with-deps chromium
+
+    - name: Metadata API and UID security regressions as root (isolated validation only)
+      run: |
+        sudo "$(command -v python)" - <<'PY'
+        import os, tempfile, unittest
+        with tempfile.TemporaryDirectory(prefix='inventory-root-') as root:
+            os.environ.update(DATA_FILE=root+'/data.json', SSH_KNOWN_HOSTS_FILE=root+'/known_hosts',
+                              TUNNEL_STATE_FILE=root+'/tunnels.json', SECRET_KEY='isolated-ci-fixture')
+            suite = unittest.defaultTestLoader.loadTestsFromNames([
+                'tests.test_integration_inventory',
+                'tests.test_peer_create_lifecycle.AdminCreateLifecycle.test_expected_server_uid_is_checked_before_intent_or_ssh'])
+            result = unittest.TextTestRunner(verbosity=2).run(suite)
+            if not result.wasSuccessful() or result.skipped: raise SystemExit(1)
+        PY
 
     - name: Run unit tests
       run: python -m unittest discover -s tests -v
