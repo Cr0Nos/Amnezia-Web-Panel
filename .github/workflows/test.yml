@@ -48,9 +48,6 @@ jobs:
             if not result.wasSuccessful() or result.skipped: raise SystemExit(1)
         PY
 
-    - name: Run unit tests
-      run: python -m unittest discover -s tests -v
-
     - name: Verify backup and peer regressions as root with isolated state
       run: |
         sudo "$(command -v python)" - <<'PY'
@@ -67,3 +64,7 @@ jobs:
             if not result.wasSuccessful():
                 raise SystemExit(1)
         PY
+
+    - name: Run unit tests
+      run: python -m unittest discover -s tests -v
+
