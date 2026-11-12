@@ -33,6 +33,24 @@ jobs:
     - name: Install Chromium for UI regression tests
       run: python -m playwright install --with-deps chromium
 
+    - name: Inventory and AWG lifecycle targeted root tests (validation only)
+      run: |
+        sudo "$(command -v python)" - <<'PY'
+        import os, tempfile, unittest
+        with tempfile.TemporaryDirectory(prefix='inventory-root-') as state:
+            os.environ.update(DATA_FILE=state+'/data.json',
+                              SSH_KNOWN_HOSTS_FILE=state+'/known_hosts',
+                              TUNNEL_STATE_FILE=state+'/tunnels.json',
+                              SECRET_KEY='isolated-validation-only')
+            suite = unittest.defaultTestLoader.loadTestsFromNames([
+                'tests.test_integration_inventory',
+                'tests.test_peer_create_lifecycle',
+                'tests.test_user_limit_readonly'])
+            result = unittest.TextTestRunner(verbosity=2).run(suite)
+            if not result.wasSuccessful() or result.skipped:
+                raise SystemExit(1)
+        PY
+
     - name: Run unit tests
       run: python -m unittest discover -s tests -v
 
